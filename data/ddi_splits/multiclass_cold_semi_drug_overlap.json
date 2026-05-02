@@ -1,0 +1,24 @@
+{
+  "counts": {
+    "train": 1346,
+    "valid": 1223,
+    "test": 1605
+  },
+  "pairwise": {
+    "train_\u2229_valid": {
+      "intersection": 1215,
+      "union": 1354,
+      "jaccard": 0.8973
+    },
+    "train_\u2229_test": {
+      "intersection": 1254,
+      "union": 1697,
+      "jaccard": 0.739
+    },
+    "valid_\u2229_test": {
+      "intersection": 1200,
+      "union": 1628,
+      "jaccard": 0.7371
+    }
+  }
+}

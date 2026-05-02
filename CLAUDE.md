@@ -1,0 +1,6 @@
+- SSH：'ssh root@10.80.8.154 -p 30209'（密钥免密登录）
+- GPU：1x 4090
+- Conda 环境：'pytorch'（Python 3.10 + PyTorch）
+- 激活：'eval "$(/opt/conda/bin/conda shell.bash hook)" && conda activate pytorch'
+- 代码目录：'/dongheyan/li/test'
+- 后台运行用 'screen'：'screen -dmS exp0 bash -c '...''
