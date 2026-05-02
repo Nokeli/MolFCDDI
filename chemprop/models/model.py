@@ -227,18 +227,41 @@ class SeqAttentionPool(nn.Module):
 # 2. 门控融合层（防止信息过平滑，保留原始语义）
 # =============================================================================
 class GatedFusion(nn.Module):
-    def __init__(self, hidden_size):
+    def __init__(self, hidden_size, dropout=0.1):
         super().__init__()
-        self.gate_z = nn.Linear(hidden_size * 2, hidden_size)  # update gate
-        self.gate_r = nn.Linear(hidden_size * 2, hidden_size)  # candidate gate
-        self.sigmoid = nn.Sigmoid()
-        self.tanh = nn.Tanh()
+
+        self.ctx_proj = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size)
+        )
+
+        self.gate = nn.Sequential(
+            nn.Linear(hidden_size * 4, hidden_size),
+            nn.Sigmoid()
+        )
+
+        self.norm = nn.LayerNorm(hidden_size)
 
     def forward(self, h_original, h_interaction):
-        combined = torch.cat([h_original, h_interaction], dim=-1)
-        z = self.sigmoid(self.gate_z(combined))   # (B, H) 决定保留多少交互信息
-        r = self.sigmoid(self.gate_r(combined))      # 候选更新向量
-        h_new = (1 - z) * h_original + z * r
+        # h_original:    (B, H)
+        # h_interaction: (B, H)
+
+        ctx = self.ctx_proj(h_interaction)
+
+        fusion_input = torch.cat([
+            h_original,
+            ctx,
+            h_original * ctx,
+            torch.abs(h_original - ctx)
+        ], dim=-1)
+
+        alpha = self.gate(fusion_input)
+
+        h_new = h_original + alpha * ctx
+        h_new = self.norm(h_new)
+
         return h_new
 
 
@@ -281,8 +304,8 @@ class DDIInteractionModel(nn.Module):
         self.pool_B = SeqAttentionPool(args.hidden_size, num_heads=getattr(args, 'num_attention_heads', 4), dropout=args.dropout)
 
         # ====================== 3. 门控融合 ======================
-        self.gate_A = GatedFusion(args.hidden_size)
-        self.gate_B = GatedFusion(args.hidden_size)
+        self.gate_A = GatedFusion(args.hidden_size, dropout=args.dropout)
+        self.gate_B = GatedFusion(args.hidden_size, dropout=args.dropout)
 
         # ====================== 4. 预测头 FFN ======================
         self.create_ffn(args)
@@ -297,8 +320,8 @@ class DDIInteractionModel(nn.Module):
             raise ValueError(f"Unknown encoder: {encoder_name}")
 
     def create_ffn(self, args):
-        """特征组合方式：concat + DDI类型嵌入"""
-        input_dim = args.hidden_size * 2  # [hA, hB, α·P_DDI]
+        """特征组合方式：concat + pair interaction [hA, hB, hA*hB, |hA-hB|]"""
+        input_dim = args.hidden_size * 4  # [hA, hB, hA⊙hB, |hA-hB|]
 
         dropout = nn.Dropout(args.dropout)
         activation = get_activation_function(args.activation)
@@ -351,11 +374,10 @@ class DDIInteractionModel(nn.Module):
         h_A_final = self.gate_A(h_global_A_fp, ctx_for_A)
         h_B_final = self.gate_B(h_global_B_fp, ctx_for_B)
 
-        # # # ====================== Step 4: 特征组合 ======================
-        # diff = torch.abs(h_A_final - h_B_final)
-        # prod = h_A_final * h_B_final
-        #combined = torch.cat([h_A_final, h_B_final, diff, prod], dim=1)
-        combined = torch.cat([h_A_final, h_B_final], dim=1)  # (B, 4*H)
+        # ====================== Step 4: 特征组合（加强 pair-level interaction）======================
+        diff = torch.abs(h_A_final - h_B_final)
+        prod = h_A_final * h_B_final
+        combined = torch.cat([h_A_final, h_B_final, diff, prod], dim=1)  # (B, 4*H)
         #combined = torch.cat([h_global_A_fp, h_global_B_fp], dim=1)  # (B, 4*H)
         # ====================== Step 4: 获取DDI类型嵌入 ======================
         # 如果提供了DDI类型标签，查询对应的嵌入
