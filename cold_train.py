@@ -1,31 +1,22 @@
 """
 Cold Start DDI Training with BPR Loss
-3-Fold Cross Validation
+3-Fold Cross Validation (or single fold via --fold)
 """
 import os
 import sys
 import time
 import warnings
-from datetime import datetime
-from collections import defaultdict  # KEEP
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
 import torch
-
-# Module-level logger — initialized in main() once output_dir is known
-_log_fh = None
-
-def log(msg=''):
-    print(msg, flush=True)
-    if _log_fh is not None:
-        _log_fh.write(msg + '\n')
-        _log_fh.flush()
 import torch.nn as nn
 from torch import optim
 from torch.utils.data import DataLoader
 from sklearn import metrics
 from rdkit import RDLogger
+from tqdm import tqdm
 
 # Suppress RDKit warnings
 RDLogger.DisableLog('rdApp.*')
@@ -39,6 +30,16 @@ from chemprop.nn_utils import param_count
 from bpr_loss import BPRLoss
 from cold_data_loader import ColdStartDataset, ColdStartCollator
 
+# Module-level logger
+_log_fh = None
+
+
+def log(msg=''):
+    tqdm.write(msg)
+    if _log_fh is not None:
+        _log_fh.write(msg + '\n')
+        _log_fh.flush()
+
 
 ######################### Parameters ######################
 import argparse
@@ -50,6 +51,8 @@ parser.add_argument('--weight_decay', type=float, default=5e-4)
 parser.add_argument('--patience', type=int, default=15)
 parser.add_argument('--min_delta', type=float, default=0.001)
 parser.add_argument('--gpu', type=int, default=0)
+parser.add_argument('--fold', type=int, default=None,
+                    help='Run specific fold (0/1/2). Default: run all 3 folds')
 parser.add_argument('--encoder_name', type=str, default='CMPNN')
 parser.add_argument('--hidden_size', type=int, default=300)
 parser.add_argument('--ffn_hidden_size', type=int, default=300)
@@ -67,9 +70,8 @@ parser.add_argument('--output_dir', type=str, default='./dumped/cold_start')
 parser.add_argument('--seed', type=int, default=42)
 args = parser.parse_args()
 
-# 补充 chemprop 框架需要的默认参数
 args.num_tasks = 1
-args.dataset_type = 'classification'  # BPR binary
+args.dataset_type = 'classification'
 args.multiclass_num_classes = 2
 args.features_only = False
 args.features_size = 0
@@ -100,7 +102,6 @@ def set_seed(seed):
 
 
 def load_pretrained_encoder(model, checkpoint_path):
-    """只加载 encoder 权重"""
     if not os.path.exists(checkpoint_path):
         log(f"Checkpoint not found: {checkpoint_path}")
         return
@@ -111,7 +112,6 @@ def load_pretrained_encoder(model, checkpoint_path):
     skipped = []
 
     for param_name, param_value in checkpoint.items():
-        # 兼容两种格式
         if param_name.startswith('encoder.'):
             encoder_key = param_name[len('encoder.'):]
         else:
@@ -133,7 +133,6 @@ def load_pretrained_encoder(model, checkpoint_path):
 
 
 def do_compute(batch, model, device):
-    """计算 batch 的 pos/neg score"""
     pos_graphs, neg_graphs = batch['pos'], batch['neg']
     rel_types = batch['rel_types']
 
@@ -156,7 +155,6 @@ def do_compute(batch, model, device):
 
 
 def do_compute_metrics(probas_pred, target, rel_types=None, per_rel=False):
-    """纯二分类指标"""
     pred = (probas_pred >= 0.5).astype(int)
     acc = metrics.accuracy_score(target, pred)
     auroc = metrics.roc_auc_score(target, probas_pred)
@@ -195,14 +193,15 @@ def do_compute_metrics(probas_pred, target, rel_types=None, per_rel=False):
 
 
 def eval_dataset(model, data_loader, device, dataset_name, per_rel=False):
-    """评估一个数据集"""
     probas_pred = []
     ground_truth = []
     rel_types = []
 
     model.eval()
+    eval_bar = tqdm(data_loader, desc=f'{dataset_name} eval', leave=False,
+                    file=sys.stderr, dynamic_ncols=True)
     with torch.no_grad():
-        for batch in data_loader:
+        for batch in eval_bar:
             _, _, batch_probas, batch_gt, batch_rel = do_compute(batch, model, device)
             probas_pred.append(batch_probas)
             ground_truth.append(batch_gt)
@@ -234,22 +233,19 @@ def eval_dataset(model, data_loader, device, dataset_name, per_rel=False):
 
 
 def train_fold(fold_idx, args, device):
-    """训练单个 fold"""
     log(f"\n{'='*60}")
     log(f"  Fold {fold_idx}")
     log(f"{'='*60}")
 
     fold_dir = os.path.join(args.data_dir, f'fold{fold_idx}')
 
-    # 加载数据
     train_ds = ColdStartDataset(os.path.join(fold_dir, 'train.csv'), args.drug_smiles)
     s1_ds = ColdStartDataset(os.path.join(fold_dir, 's1.csv'), args.drug_smiles)
     s2_ds = ColdStartDataset(os.path.join(fold_dir, 's2.csv'), args.drug_smiles)
 
     collator = ColdStartCollator(args)
-    # 减小 batch_size 避免 OOM；用 gradient accumulation 补偿
     train_bs = 128
-    accum_steps = args.batch_size // train_bs  # 等效 batch = 512
+    accum_steps = args.batch_size // train_bs
     train_loader = DataLoader(train_ds, batch_size=train_bs,
                               shuffle=True, collate_fn=collator, num_workers=0)
     s1_loader = DataLoader(s1_ds, batch_size=256,
@@ -259,7 +255,6 @@ def train_fold(fold_idx, args, device):
 
     log(f"Train: {len(train_ds)}, S1: {len(s1_ds)}, S2: {len(s2_ds)}")
 
-    # 模型
     model = build_ddi_model(args)
     if args.step == 'func_prompt':
         add_FUNC_prompt(model, args)
@@ -268,7 +263,6 @@ def train_fold(fold_idx, args, device):
     model.to(device)
     log(f"Parameters: {param_count(model):,}")
 
-    # 优化器
     loss_fn = BPRLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: 0.96 ** epoch)
@@ -279,46 +273,48 @@ def train_fold(fold_idx, args, device):
     best_s2_epoch = 0
     patience_counter = 0
 
-    # 训练循环
-    log(f"Starting training loop: {args.n_epochs} epochs, {len(train_loader)} batches/epoch")
-    for epoch in range(1, args.n_epochs + 1):
+    log(f"Starting training: {args.n_epochs} epochs, {len(train_loader)} batches/epoch")
+
+    epoch_bar = tqdm(range(1, args.n_epochs + 1), desc=f'Fold {fold_idx}',
+                     file=sys.stderr, dynamic_ncols=True)
+    for epoch in epoch_bar:
         start = time.time()
 
-        # Train (with gradient accumulation)
         model.train()
         train_loss = 0.0
+        n_samples = 0
         optimizer.zero_grad()
-        for batch_idx, batch in enumerate(train_loader):
+
+        batch_bar = tqdm(train_loader, desc=f'Ep {epoch} train',
+                         leave=False, file=sys.stderr, dynamic_ncols=True)
+        for batch_idx, batch in enumerate(batch_bar):
             pos_score, neg_score, _, _, _ = do_compute(batch, model, device)
             loss, _, _ = loss_fn(pos_score, neg_score)
-            loss = loss / accum_steps  # scale loss
+            loss = loss / accum_steps
             loss.backward()
             train_loss += loss.item() * accum_steps * len(pos_score)
-            
+            n_samples += len(pos_score)
+
             if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
                 optimizer.step()
                 optimizer.zero_grad()
-            if batch_idx % 100 == 0:
-                log(f"  [Fold {fold_idx} Ep {epoch}] batch {batch_idx}/{len(train_loader)}, loss={loss.item() * accum_steps:.4f}")
-        train_loss /= len(train_ds)
 
-        # Eval
+            batch_bar.set_postfix(loss=f'{loss.item() * accum_steps:.4f}')
+
+        train_loss /= n_samples
+
         s1_scores = eval_dataset(model, s1_loader, device, 'S1')
         s2_scores = eval_dataset(model, s2_loader, device, 'S2')
 
-        # Save best
-        s1_improved = s2_improved = False
         if s1_scores['acc'] > best_s1_acc + args.min_delta:
             best_s1_acc = s1_scores['acc']
             best_s1_epoch = epoch
-            s1_improved = True
             torch.save(model, os.path.join(args.output_dir, f'best_s1_fold{fold_idx}.pt'))
             log(f"  *** New best S1: acc={best_s1_acc:.4f} (epoch {epoch}) ***")
 
         if s2_scores['acc'] > best_s2_acc + args.min_delta:
             best_s2_acc = s2_scores['acc']
             best_s2_epoch = epoch
-            s2_improved = True
             patience_counter = 0
             torch.save(model, os.path.join(args.output_dir, f'best_s2_fold{fold_idx}.pt'))
             log(f"  *** New best S2: acc={best_s2_acc:.4f} (epoch {epoch}) ***")
@@ -327,33 +323,38 @@ def train_fold(fold_idx, args, device):
 
         scheduler.step()
 
-        # Log
-        log(f"Epoch {epoch:3d}/{args.n_epochs} ({time.time()-start:.1f}s) | "
-              f"train_loss: {train_loss:.4f} | "
-              f"S1_acc: {s1_scores['acc']:.4f} S1_auc: {s1_scores['auroc']:.4f} | "
-              f"S2_acc: {s2_scores['acc']:.4f} S2_auc: {s2_scores['auroc']:.4f} | "
-              f"Patience: {patience_counter}/{args.patience}")
+        epoch_sec = time.time() - start
+        log(f"Epoch {epoch:3d}/{args.n_epochs} ({epoch_sec:.1f}s) | "
+            f"loss: {train_loss:.4f} | "
+            f"S1_acc: {s1_scores['acc']:.4f} S1_auc: {s1_scores['auroc']:.4f} | "
+            f"S2_acc: {s2_scores['acc']:.4f} S2_auc: {s2_scores['auroc']:.4f} | "
+            f"Patience: {patience_counter}/{args.patience}")
 
-        # Early stopping
+        epoch_bar.set_postfix(
+            loss=f'{train_loss:.4f}',
+            S1_acc=f'{s1_scores["acc"]:.4f}',
+            S2_acc=f'{s2_scores["acc"]:.4f}',
+            patience=f'{patience_counter}/{args.patience}')
+
         if patience_counter >= args.patience:
             log(f"\nEarly stopping at epoch {epoch}")
             break
 
     log(f"\nFold {fold_idx} Best: S1@ep{best_s1_epoch} acc={best_s1_acc:.4f}, "
-          f"S2@ep{best_s2_epoch} acc={best_s2_acc:.4f}")
+        f"S2@ep{best_s2_epoch} acc={best_s2_acc:.4f}")
 
-    # Final test with best models
-    s1_best = torch.load(os.path.join(args.output_dir, f'best_s1_fold{fold_idx}.pt'))
-    s2_best = torch.load(os.path.join(args.output_dir, f'best_s2_fold{fold_idx}.pt'))
+    s1_best = torch.load(os.path.join(args.output_dir, f'best_s1_fold{fold_idx}.pt'),
+                         map_location=device).to(device)
+    s2_best = torch.load(os.path.join(args.output_dir, f'best_s2_fold{fold_idx}.pt'),
+                         map_location=device).to(device)
 
     final_s1 = eval_dataset(s1_best, s1_loader, device, 'S1', per_rel=True)
     final_s2 = eval_dataset(s2_best, s2_loader, device, 'S2', per_rel=True)
 
-    return final_s1, final_s2
+    return final_s1, final_s2, best_s1_epoch, best_s2_epoch
 
 
 def average_metrics(results_list):
-    """多个 fold 的结果取平均"""
     avg = {}
     keys = ['acc', 'auroc', 'f1', 'precision', 'recall', 'int_ap', 'ap']
     for k in keys:
@@ -363,7 +364,6 @@ def average_metrics(results_list):
 
 
 def aggregate_per_rel(fold_results):
-    """聚合 per-relation 指标"""
     all_rel_metrics = defaultdict(list)
     for fold_res in fold_results:
         if 'rel_metrics' not in fold_res:
@@ -382,10 +382,8 @@ def aggregate_per_rel(fold_results):
 
 
 def save_results(fold_results, output_path):
-    """保存 per-relation CSV"""
     rows = []
 
-    # S1
     s1_results = [r['s1'] for r in fold_results]
     avg_s1 = average_metrics(s1_results)
     rows.append({
@@ -395,7 +393,6 @@ def save_results(fold_results, output_path):
         'Int_AP': avg_s1['int_ap'], 'AP': avg_s1['ap']
     })
 
-    # S1 per-rel
     s1_rel = aggregate_per_rel(s1_results)
     for rel in sorted(s1_rel.keys()):
         m = s1_rel[rel]
@@ -406,7 +403,6 @@ def save_results(fold_results, output_path):
             'Int_AP': m['int_ap'], 'AP': m['ap']
         })
 
-    # S2
     s2_results = [r['s2'] for r in fold_results]
     avg_s2 = average_metrics(s2_results)
     rows.append({
@@ -416,7 +412,6 @@ def save_results(fold_results, output_path):
         'Int_AP': avg_s2['int_ap'], 'AP': avg_s2['ap']
     })
 
-    # S2 per-rel
     s2_rel = aggregate_per_rel(s2_results)
     for rel in sorted(s2_rel.keys()):
         m = s2_rel[rel]
@@ -437,39 +432,58 @@ def main():
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # 初始化日志文件
     global _log_fh
-    log_path = os.path.join(args.output_dir, 'train.log')
+    folds = [args.fold] if args.fold is not None else [0, 1, 2]
+    fold_tag = f'_fold{args.fold}' if args.fold is not None else ''
+    log_path = os.path.join(args.output_dir, f'train{fold_tag}.log')
     _log_fh = open(log_path, 'w', buffering=1)
 
     log(f"{'='*60}")
     log(f"  Cold Start DDI Training (BPR)")
     log(f"  Device: {device}")
-    log(f"  3-Fold CV | lr={args.lr} | batch={args.batch_size}")
+    log(f"  Folds: {folds} | lr={args.lr} | batch={args.batch_size}")
     log(f"{'='*60}")
 
     fold_results = []
-    for fold in [0, 1, 2]:
-        s1_res, s2_res = train_fold(fold, args, device)
-        fold_results.append({'s1': s1_res, 's2': s2_res})
+    for fold in folds:
+        s1_res, s2_res, s1_ep, s2_ep = train_fold(fold, args, device)
+        fold_results.append({'s1': s1_res, 's2': s2_res,
+                             'best_s1_epoch': s1_ep, 'best_s2_epoch': s2_ep})
 
-    # Summary
-    log(f"\n{'='*60}")
-    log(f"  3-Fold Average Results")
-    log(f"{'='*60}")
+    if len(folds) == 1:
+        log(f"\n{'='*60}")
+        log(f"  Fold {folds[0]} Results")
+        log(f"{'='*60}")
+        r = fold_results[0]
+        log(f"  S1: Acc={r['s1']['acc']:.4f} AUROC={r['s1']['auroc']:.4f} "
+            f"F1={r['s1']['f1']:.4f} AUPR={r['s1']['ap']:.4f} "
+            f"(best@ep{r['best_s1_epoch']})")
+        log(f"  S2: Acc={r['s2']['acc']:.4f} AUROC={r['s2']['auroc']:.4f} "
+            f"F1={r['s2']['f1']:.4f} AUPR={r['s2']['ap']:.4f} "
+            f"(best@ep{r['best_s2_epoch']})")
 
-    avg_s1 = average_metrics([r['s1'] for r in fold_results])
-    avg_s2 = average_metrics([r['s2'] for r in fold_results])
+        df = save_results(fold_results,
+                          os.path.join(args.output_dir, f'per_relation_results{fold_tag}.csv'))
+    else:
+        log(f"\n{'='*60}")
+        log(f"  3-Fold Average Results")
+        log(f"{'='*60}")
 
-    log(f"  S1: Acc={avg_s1['acc']:.4f} AUROC={avg_s1['auroc']:.4f} "
-          f"F1={avg_s1['f1']:.4f} AUPR={avg_s1['ap']:.4f}")
-    log(f"  S2: Acc={avg_s2['acc']:.4f} AUROC={avg_s2['auroc']:.4f} "
-          f"F1={avg_s2['f1']:.4f} AUPR={avg_s2['ap']:.4f}")
+        avg_s1 = average_metrics([r['s1'] for r in fold_results])
+        avg_s2 = average_metrics([r['s2'] for r in fold_results])
 
-    # Save
-    df = save_results(fold_results, os.path.join(args.output_dir, 'per_relation_results.csv'))
+        log(f"  S1: Acc={avg_s1['acc']:.4f} AUROC={avg_s1['auroc']:.4f} "
+            f"F1={avg_s1['f1']:.4f} AUPR={avg_s1['ap']:.4f}")
+        log(f"  S2: Acc={avg_s2['acc']:.4f} AUROC={avg_s2['auroc']:.4f} "
+            f"F1={avg_s2['f1']:.4f} AUPR={avg_s2['ap']:.4f}")
+
+        df = save_results(fold_results,
+                          os.path.join(args.output_dir, 'per_relation_results.csv'))
+
     log("\nFinal Results Table:")
     log(df.to_string())
+
+    _log_fh.close()
 
 
 if __name__ == '__main__':
