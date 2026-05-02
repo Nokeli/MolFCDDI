@@ -192,44 +192,57 @@ def do_compute_metrics(probas_pred, target, rel_types=None, per_rel=False):
     return acc, auroc, f1, precision, recall, int_ap, ap
 
 
-def eval_dataset(model, data_loader, device, dataset_name, per_rel=False):
+def eval_dataset(model, data_loader, device, dataset_name, loss_fn=None, per_rel=False):
     probas_pred = []
     ground_truth = []
     rel_types = []
+    eval_loss = 0.0
+    n_samples = 0
 
     model.eval()
     eval_bar = tqdm(data_loader, desc=f'{dataset_name} eval', leave=False,
                     file=sys.stderr, dynamic_ncols=True)
     with torch.no_grad():
         for batch in eval_bar:
-            _, _, batch_probas, batch_gt, batch_rel = do_compute(batch, model, device)
+            pos_score, neg_score, batch_probas, batch_gt, batch_rel = do_compute(batch, model, device)
             probas_pred.append(batch_probas)
             ground_truth.append(batch_gt)
             rel_types.append(batch_rel)
+
+            if loss_fn is not None:
+                loss, _, _ = loss_fn(pos_score, neg_score)
+                eval_loss += loss.item() * len(pos_score)
+                n_samples += len(pos_score)
 
     probas_pred = np.concatenate(probas_pred)
     ground_truth = np.concatenate(ground_truth)
     rel_types = np.concatenate(rel_types)
 
+    result = {}
+    if loss_fn is not None and n_samples > 0:
+        result['loss'] = eval_loss / n_samples
+
     if per_rel:
         acc, auroc, f1, precision, recall, int_ap, ap, rel_metrics = \
             do_compute_metrics(probas_pred, ground_truth, rel_types, per_rel=True)
-        return {
+        result.update({
             'acc': acc, 'auroc': auroc, 'f1': f1,
             'precision': precision, 'recall': recall,
             'int_ap': int_ap, 'ap': ap,
             'rel_metrics': rel_metrics,
             'probas_pred': probas_pred, 'ground_truth': ground_truth,
             'rel_types': rel_types
-        }
+        })
+        return result
 
     acc, auroc, f1, precision, recall, int_ap, ap = \
         do_compute_metrics(probas_pred, ground_truth, rel_types, per_rel=False)
-    return {
+    result.update({
         'acc': acc, 'auroc': auroc, 'f1': f1,
         'precision': precision, 'recall': recall,
         'int_ap': int_ap, 'ap': ap
-    }
+    })
+    return result
 
 
 def train_fold(fold_idx, args, device):
@@ -248,9 +261,10 @@ def train_fold(fold_idx, args, device):
     accum_steps = args.batch_size // train_bs
     train_loader = DataLoader(train_ds, batch_size=train_bs,
                               shuffle=True, collate_fn=collator, num_workers=0)
-    s1_loader = DataLoader(s1_ds, batch_size=256,
+    eval_bs = 1024
+    s1_loader = DataLoader(s1_ds, batch_size=eval_bs,
                            shuffle=False, collate_fn=collator, num_workers=0)
-    s2_loader = DataLoader(s2_ds, batch_size=256,
+    s2_loader = DataLoader(s2_ds, batch_size=eval_bs,
                            shuffle=False, collate_fn=collator, num_workers=0)
 
     log(f"Train: {len(train_ds)}, S1: {len(s1_ds)}, S2: {len(s2_ds)}")
@@ -290,34 +304,38 @@ def train_fold(fold_idx, args, device):
         for batch_idx, batch in enumerate(batch_bar):
             pos_score, neg_score, _, _, _ = do_compute(batch, model, device)
             loss, _, _ = loss_fn(pos_score, neg_score)
-            loss = loss / accum_steps
             loss.backward()
-            train_loss += loss.item() * accum_steps * len(pos_score)
+            train_loss += loss.item() * len(pos_score)
             n_samples += len(pos_score)
 
             if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
                 optimizer.step()
                 optimizer.zero_grad()
 
-            batch_bar.set_postfix(loss=f'{loss.item() * accum_steps:.4f}')
+            batch_bar.set_postfix(loss=f'{loss.item():.4f}')
 
         train_loss /= n_samples
 
-        s1_scores = eval_dataset(model, s1_loader, device, 'S1')
-        s2_scores = eval_dataset(model, s2_loader, device, 'S2')
+        s1_scores = eval_dataset(model, s1_loader, device, 'S1', loss_fn=loss_fn)
+        s2_scores = eval_dataset(model, s2_loader, device, 'S2', loss_fn=loss_fn)
 
-        if s1_scores['acc'] > best_s1_acc + args.min_delta:
+        s1_improved = s1_scores['acc'] > best_s1_acc + args.min_delta
+        s2_improved = s2_scores['acc'] > best_s2_acc + args.min_delta
+
+        if s1_improved:
             best_s1_acc = s1_scores['acc']
             best_s1_epoch = epoch
             torch.save(model, os.path.join(args.output_dir, f'best_s1_fold{fold_idx}.pt'))
             log(f"  *** New best S1: acc={best_s1_acc:.4f} (epoch {epoch}) ***")
 
-        if s2_scores['acc'] > best_s2_acc + args.min_delta:
+        if s2_improved:
             best_s2_acc = s2_scores['acc']
             best_s2_epoch = epoch
-            patience_counter = 0
             torch.save(model, os.path.join(args.output_dir, f'best_s2_fold{fold_idx}.pt'))
             log(f"  *** New best S2: acc={best_s2_acc:.4f} (epoch {epoch}) ***")
+
+        if s1_improved or s2_improved:
+            patience_counter = 0
         else:
             patience_counter += 1
 
@@ -325,7 +343,7 @@ def train_fold(fold_idx, args, device):
 
         epoch_sec = time.time() - start
         log(f"Epoch {epoch:3d}/{args.n_epochs} ({epoch_sec:.1f}s) | "
-            f"loss: {train_loss:.4f} | "
+            f"train_loss: {train_loss:.4f} s1_loss: {s1_scores.get('loss', 0):.4f} s2_loss: {s2_scores.get('loss', 0):.4f} | "
             f"S1_acc: {s1_scores['acc']:.4f} S1_auc: {s1_scores['auroc']:.4f} | "
             f"S2_acc: {s2_scores['acc']:.4f} S2_auc: {s2_scores['auroc']:.4f} | "
             f"Patience: {patience_counter}/{args.patience}")

@@ -1,5 +1,6 @@
 """
-BPR Loss for Cold Start DDI Training
+Sigmoid BCE Loss for Cold Start DDI Training
+对齐参考代码 inductive_train.py 的 custom_loss.SigmoidLoss
 """
 import torch
 import torch.nn as nn
@@ -8,22 +9,15 @@ import torch.nn.functional as F
 
 class BPRLoss(nn.Module):
     """
-    Bayesian Personalized Ranking Loss
-    优化 pos_score > neg_score
-    兼容 inductive_train.py 接口: forward 返回 (loss, loss_p, loss_n)
+    Sigmoid BCE Loss (对齐参考代码的 SigmoidLoss)
+    pos_score -> +∞ (sigmoid -> 1), neg_score -> -∞ (sigmoid -> 0)
+    返回 (total_loss, pos_loss, neg_loss) 兼容原接口
     """
-    def __init__(self, margin: float = 0.0):
+    def __init__(self):
         super().__init__()
-        self.margin = margin
-    
+
     def forward(self, pos_score: torch.Tensor, neg_score: torch.Tensor):
-        """
-        Args:
-            pos_score: (B,) 正样本对 score
-            neg_score: (B,) 负样本对 score
-        Returns:
-            loss, loss_p, loss_n  （三个相同值，兼容对方 unpack）
-        """
-        diff = pos_score - neg_score - self.margin
-        loss = -F.logsigmoid(diff).mean()
-        return loss, loss, loss
+        p_loss = -F.logsigmoid(pos_score).mean()      # BCE(pos, 1)
+        n_loss = -F.logsigmoid(-neg_score).mean()     # BCE(neg, 0)
+        loss = (p_loss + n_loss) / 2
+        return loss, p_loss, n_loss
