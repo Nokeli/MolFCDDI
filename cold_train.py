@@ -270,10 +270,10 @@ def train_fold(fold_idx, args, device):
     log(f"Train: {len(train_ds)}, S1: {len(s1_ds)}, S2: {len(s2_ds)}")
 
     model = build_ddi_model(args)
-    if args.step == 'func_prompt':
-        add_FUNC_prompt(model, args)
     if args.checkpoint_path and os.path.exists(args.checkpoint_path):
         load_pretrained_encoder(model, args.checkpoint_path)
+    if args.step == 'func_prompt':
+        add_FUNC_prompt(model, args)
     model.to(device)
     log(f"Parameters: {param_count(model):,}")
 
