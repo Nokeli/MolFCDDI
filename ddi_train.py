@@ -38,16 +38,16 @@ def create_args():
     parser = ArgumentParser()
 
     # Data / Split
-    parser.add_argument('--split_name', type=str, default='S1_random',
-                        choices=['S1_random', 'S2_one_unseen', 'S3_both_unseen'])
+    parser.add_argument('--split_name', type=str, default='warm_start',
+                        choices=['S1_random', 'S2_one_unseen', 'S3_both_unseen', 'warm_start', 'cold_semi', 'cold_strict'])
     parser.add_argument('--mode', type=str, default='multiclass',
                         choices=['binary', 'multiclass'])
     parser.add_argument('--split_dir', type=str,
-                        default='E:/学习/molfcddi/data/splits')
+                        default='./data/ddi_warm_start')
 
     # Model
     parser.add_argument('--checkpoint_path', type=str,
-                        default='E:/学习/molfcddi/ckpt/original_MoleculeModel.pkl')
+                        default='./ckpt/original_MoleculeModel.pkl')
     parser.add_argument('--encoder', action='store_true', default=False)
     parser.add_argument('--encoder_name', type=str, default='CMPNN',
                         choices=['CMPNN', 'MPNN', 'PharmHGT', 'CMPNDGL'])
@@ -151,7 +151,7 @@ def create_args():
     # Generate save_dir if not provided
     if args.save_dir is None:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        args.save_dir = f'E:/学习/molfcddi/dumped/{args.split_name}_{args.mode}_{timestamp}'
+        args.save_dir = f'./dumped/{args.split_name}_{args.mode}_{timestamp}'
     args.exp_name = f'{args.split_name}_{args.mode}'
     args.exp_id = f'{args.split_name}_{args.mode}'
 

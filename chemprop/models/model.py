@@ -120,149 +120,131 @@ class MoleculeModel(nn.Module):
         return output
 
 
-class GroupCoAttentionLayer(nn.Module):
+class CrossAttentionLayer(nn.Module):
     """
-    Group-to-Group Co-Attention: 两个药物的官能团序列互为 Query/Key/Value。
-    A 的每个官能团去看 B 的哪些官能团重要，反之亦然。
+    跨分子注意力：用一个药物的全局向量 Query 另一个药物的官能团序列（Key/Value）
+    输出：该药物"看到"的对方关键官能团上下文 + 注意力权重图（可解释性热力图）
     """
     def __init__(self, args: Namespace):
         super().__init__()
         self.hidden_size = args.hidden_size
         self.num_heads = getattr(args, 'num_attention_heads', 4)
 
-        self.attn_AB = nn.MultiheadAttention(
+        self.multihead_attn = nn.MultiheadAttention(
             embed_dim=self.hidden_size,
             num_heads=self.num_heads,
             dropout=args.dropout,
             batch_first=True
         )
-        self.attn_BA = nn.MultiheadAttention(
-            embed_dim=self.hidden_size,
-            num_heads=self.num_heads,
-            dropout=args.dropout,
-            batch_first=True
-        )
-        self.layer_norm_A = nn.LayerNorm(self.hidden_size)
-        self.layer_norm_B = nn.LayerNorm(self.hidden_size)
+        self.layer_norm = nn.LayerNorm(self.hidden_size)
         self.dropout = nn.Dropout(args.dropout)
 
-    def forward(self, fg_A, fg_B, mask_A=None, mask_B=None):
+    def forward(self, query_global, key_fgs, key_padding_mask=None):
         """
         Args:
-            fg_A: (B, L_A, H)
-            fg_B: (B, L_B, H)
-            mask_A: (B, L_A) bool, True for padding
-            mask_B: (B, L_B) bool, True for padding
+            query_global: (B, H)           - 对方药物的全局表征
+            key_fgs:      (B, L, H)         - 本药物的官能团序列（含 padding）
+            key_padding_mask: (B, L) bool   - True 表示该位置是 padding
         Returns:
-            updated_A: (B, L_A, H)  – A 看过 B 后的更新序列
-            updated_B: (B, L_B, H)  – B 看过 A 后的更新序列
-            attn_AB:   (B, L_A, L_B) – A→B 注意力权重
-            attn_BA:   (B, L_B, L_A) – B→A 注意力权重
+            ctx:          (B, H)            - 交互上下文向量
+            attn_weights: (B, 1, L)         - 注意力分布（哪个官能团被关注）
         """
-        # A queries B
-        co_A, attn_AB = self.attn_AB(
-            query=fg_A, key=fg_B, value=fg_B,
-            key_padding_mask=mask_B, need_weights=True
-        )
-        co_A = self.layer_norm_A(self.dropout(co_A) + fg_A)
+        B = query_global.size(0)
+        query = query_global.unsqueeze(1)  # (B, 1, H)
 
-        # B queries A
-        co_B, attn_BA = self.attn_BA(
-            query=fg_B, key=fg_A, value=fg_A,
-            key_padding_mask=mask_A, need_weights=True
-        )
-        co_B = self.layer_norm_B(self.dropout(co_B) + fg_B)
+        if key_padding_mask is not None:
+            # key_padding_mask 应该是 (B, L) 的布尔张量，True 表示需要mask
+            attn_mask = key_padding_mask  # PyTorch的MultiheadAttention会自动处理
+        else:
+            attn_mask = None
 
-        return co_A, co_B, attn_AB, attn_BA
-
-
-# =============================================================================
-# 2.1 序列注意力池化（替代粗暴 mean pooling）
-# =============================================================================
-class SeqAttentionPool(nn.Module):
-    """
-    对序列做 attention-based pooling：学一个可学习的 query，
-    对序列内各位置加权求和，自动抑制 padding 和无关位置。
-    """
-    def __init__(self, hidden_size: int, num_heads: int = 4, dropout: float = 0.1):
-        super().__init__()
-        self.hidden_size = hidden_size
-        # 可学习的全局 query 向量
-        self.query = nn.Parameter(torch.randn(1, 1, hidden_size))
-        nn.init.xavier_uniform_(self.query)
-
-        self.attn = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.layer_norm = nn.LayerNorm(hidden_size)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, seq, mask=None):
-        """
-        Args:
-            seq:  (B, L, H)
-            mask: (B, L) bool, True for padding
-        Returns:
-            out:  (B, H)
-        """
-        B = seq.size(0)
-        query = self.query.expand(B, 1, -1)  # (B, 1, H)
-
-        attn_output, attn_weights = self.attn(
+        attn_output, attn_weights = self.multihead_attn(
             query=query,
-            key=seq,
-            value=seq,
-            key_padding_mask=mask,
-            need_weights=True
+            key=key_fgs,
+            value=key_fgs,
+            key_padding_mask=attn_mask,  # 使用 key_padding_mask 参数
+            need_weights=True,
         )
-        out = attn_output.squeeze(1)  # (B, H)
-        out = self.layer_norm(self.dropout(out) + query.squeeze(1))
-        return out
+
+        ctx = attn_output.squeeze(1)  # (B, H)
+        return ctx, attn_weights  # attn_weights 可用于可视化
 
 
 # =============================================================================
 # 2. 门控融合层（防止信息过平滑，保留原始语义）
 # =============================================================================
 class GatedFusion(nn.Module):
-    def __init__(self, hidden_size, dropout=0.1):
+    def __init__(self, hidden_size):
         super().__init__()
-
-        self.ctx_proj = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, hidden_size)
-        )
-
-        self.gate = nn.Sequential(
-            nn.Linear(hidden_size * 4, hidden_size),
-            nn.Sigmoid()
-        )
-
-        self.norm = nn.LayerNorm(hidden_size)
+        self.gate_z = nn.Linear(hidden_size * 2, hidden_size)  # update gate
+        self.gate_r = nn.Linear(hidden_size * 2, hidden_size)  # candidate gate
+        self.sigmoid = nn.Sigmoid()
+        self.tanh = nn.Tanh()
 
     def forward(self, h_original, h_interaction):
-        # h_original:    (B, H)
-        # h_interaction: (B, H)
-
-        ctx = self.ctx_proj(h_interaction)
-
-        fusion_input = torch.cat([
-            h_original,
-            ctx,
-            h_original * ctx,
-            torch.abs(h_original - ctx)
-        ], dim=-1)
-
-        alpha = self.gate(fusion_input)
-
-        h_new = h_original + alpha * ctx
-        h_new = self.norm(h_new)
-
+        combined = torch.cat([h_original, h_interaction], dim=-1)
+        z = self.sigmoid(self.gate_z(combined))   # (B, H) 决定保留多少交互信息
+        r = self.sigmoid(self.gate_r(combined))      # 候选更新向量
+        h_new = (1 - z) * h_original + z * r
         return h_new
+
+
+class CrossFragmentInteraction(nn.Module):
+    """
+    显式建模药物A片段与药物B片段之间的交互矩阵。
+    输出双向交互摘要以及可解释的片段-片段注意力图。
+    """
+    def __init__(self, args: Namespace):
+        super().__init__()
+        self.hidden_size = args.hidden_size
+        self.scale = math.sqrt(self.hidden_size)
+        self.query_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=args.bias)
+        self.key_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=args.bias)
+        self.value_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=args.bias)
+        self.out_proj = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=args.bias)
+        self.dropout = nn.Dropout(args.dropout)
+        self.norm = nn.LayerNorm(self.hidden_size)
+
+    def _masked_mean(self, values: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        weights = valid_mask.float().unsqueeze(-1)
+        denom = weights.sum(dim=1).clamp(min=1.0)
+        return (values * weights).sum(dim=1) / denom
+
+    def forward(self,
+                frag_a: torch.Tensor,
+                frag_b: torch.Tensor,
+                mask_a: torch.Tensor,
+                mask_b: torch.Tensor):
+        q_a = self.query_proj(frag_a)
+        k_b = self.key_proj(frag_b)
+        v_b = self.value_proj(frag_b)
+
+        logits_ab = torch.matmul(q_a, k_b.transpose(-2, -1)) / self.scale
+        valid_ab = (~mask_a).unsqueeze(-1) & (~mask_b).unsqueeze(1)
+        logits_ab = logits_ab.masked_fill(~valid_ab, -1e9)
+        attn_ab = F.softmax(logits_ab, dim=-1)
+        attn_ab = attn_ab * valid_ab.float()
+        attn_ab = self.dropout(attn_ab)
+        cross_a = torch.matmul(attn_ab, v_b)
+        cross_a = self.norm(frag_a + cross_a)
+        pooled_a = self._masked_mean(cross_a, ~mask_a)
+
+        q_b = self.query_proj(frag_b)
+        k_a = self.key_proj(frag_a)
+        v_a = self.value_proj(frag_a)
+
+        logits_ba = torch.matmul(q_b, k_a.transpose(-2, -1)) / self.scale
+        valid_ba = (~mask_b).unsqueeze(-1) & (~mask_a).unsqueeze(1)
+        logits_ba = logits_ba.masked_fill(~valid_ba, -1e9)
+        attn_ba = F.softmax(logits_ba, dim=-1)
+        attn_ba = attn_ba * valid_ba.float()
+        attn_ba = self.dropout(attn_ba)
+        cross_b = torch.matmul(attn_ba, v_a)
+        cross_b = self.norm(frag_b + cross_b)
+        pooled_b = self._masked_mean(cross_b, ~mask_b)
+
+        cross_pair = self.out_proj(torch.cat([pooled_a, pooled_b], dim=-1))
+        return cross_pair, attn_ab, attn_ba
 
 
 # =============================================================================
@@ -285,27 +267,11 @@ class DDIInteractionModel(nn.Module):
         # ====================== 1. 共享编码器（Siamese） ======================
         self.encoder = self._create_encoder(args)
 
-        # ====================== 2. 跨分子交互模块 ======================
-        self.group_co_attn = GroupCoAttentionLayer(args)  # group-to-group co-attention
-
-        # ====================== 2.5 DDI类型嵌入表（新设计） ======================
-        # 可学习的DDI类型嵌入表，用于提供DDI交互类型的先验知识
-        self.ddi_type_embedding = nn.Parameter(
-            torch.randn(86, args.hidden_size),
-            requires_grad=True
-        )
-
-        # 可学习的缩放因子，用于平衡全局结构信息与DDI类型嵌入
-        self.alpha = nn.Parameter(torch.FloatTensor(1))
-        self.alpha.data.fill_(0.1)
-
-        # ====================== 2.6 序列注意力池化（替代 mean pooling）======================
-        self.pool_A = SeqAttentionPool(args.hidden_size, num_heads=getattr(args, 'num_attention_heads', 4), dropout=args.dropout)
-        self.pool_B = SeqAttentionPool(args.hidden_size, num_heads=getattr(args, 'num_attention_heads', 4), dropout=args.dropout)
-
-        # ====================== 3. 门控融合 ======================
-        self.gate_A = GatedFusion(args.hidden_size, dropout=args.dropout)
-        self.gate_B = GatedFusion(args.hidden_size, dropout=args.dropout)
+        # ====================== 2. 片段-片段交互模块 ======================
+        self.cross_fragment = CrossFragmentInteraction(args)
+        self.gate_A = GatedFusion(args.hidden_size)
+        self.gate_B = GatedFusion(args.hidden_size)
+        self.last_interaction = None
 
         # ====================== 4. 预测头 FFN ======================
         self.create_ffn(args)
@@ -320,8 +286,8 @@ class DDIInteractionModel(nn.Module):
             raise ValueError(f"Unknown encoder: {encoder_name}")
 
     def create_ffn(self, args):
-        """特征组合方式：concat + pair interaction [hA, hB, hA*hB, |hA-hB|]"""
-        input_dim = args.hidden_size * 4  # [hA, hB, hA⊙hB, |hA-hB|]
+        """最终表示 z_AB = [h_A, h_B, h_AB_frag]。"""
+        input_dim = args.hidden_size * 3
 
         dropout = nn.Dropout(args.dropout)
         activation = get_activation_function(args.activation)
@@ -332,13 +298,22 @@ class DDIInteractionModel(nn.Module):
             activation,
         ]
 
-        # BPR binary: 强制输出 1-dim score
+        # 多分类需要更大输出
+        output_size = args.output_size
+        if self.multiclass:
+            output_size = args.output_size * self.num_classes
+
         layers.extend([
             dropout,
-            nn.Linear(args.ffn_hidden_size, 1)
+            nn.Linear(args.ffn_hidden_size, output_size)
         ])
 
         self.ffn = nn.Sequential(*layers)
+
+    def _ensure_valid_fragments(self, frag_repr: torch.Tensor) -> torch.Tensor:
+        if frag_repr.size(1) == 0:
+            return frag_repr.new_zeros(frag_repr.size(0), 1, frag_repr.size(2))
+        return frag_repr
 
     def forward(self, step, pretrain, batch_graph_A, batch_graph_B, pooling_type, ddi_type=None):
         """
@@ -356,50 +331,32 @@ class DDIInteractionModel(nn.Module):
             attn_weights: 注意力权重（用于可视化）
         """
         # ====================== Step 1: 独立编码 ======================
-        fg_A, h_global_A, h_global_A_fp = self.encoder(step, pretrain, batch_graph_A)   # fg: (B, max_fg, H)
+        fg_A, h_global_A, h_global_A_fp = self.encoder(step, pretrain, batch_graph_A)
         fg_B, h_global_B, h_global_B_fp = self.encoder(step, pretrain, batch_graph_B)
-        fg_A = fg_A[:, 1:, :]
-        fg_B = fg_B[:, 1:, :]
+        fg_A = self._ensure_valid_fragments(fg_A[:, 1:, :])
+        fg_B = self._ensure_valid_fragments(fg_B[:, 1:, :])
 
-        # ====================== Step 2: Group-to-Group Co-Attention ======================
-        mask_A = (fg_A.sum(dim=-1) == 0)
-        mask_B = (fg_B.sum(dim=-1) == 0)
-        co_A, co_B, attn_AB, attn_BA = self.group_co_attn(fg_A, fg_B, mask_A, mask_B)
+        # Step 2: 显式片段-片段交互矩阵
+        mask_A = fg_A.abs().sum(dim=-1) == 0
+        mask_B = fg_B.abs().sum(dim=-1) == 0
+        cross_frag, attn_ab, attn_ba = self.cross_fragment(fg_A, fg_B, mask_A, mask_B)
 
-        # 将更新后的 co-attention 序列池化为全局交互上下文
-        ctx_for_A = self.pool_A(co_A, mask=mask_A)   # (B, H)
-        ctx_for_B = self.pool_B(co_B, mask=mask_B)   # (B, H)
+        # Step 3: 用片段交互摘要更新分子级表征
+        h_A_final = self.gate_A(h_global_A_fp, cross_frag)
+        h_B_final = self.gate_B(h_global_B_fp, cross_frag)
 
-        # ====================== Step 3: 门控融合 ======================
-        h_A_final = self.gate_A(h_global_A_fp, ctx_for_A)
-        h_B_final = self.gate_B(h_global_B_fp, ctx_for_B)
+        # Step 4: z_AB = [h_A, h_B, h_AB_frag]
+        combined = torch.cat([h_A_final, h_B_final, cross_frag], dim=1)
+        logits = self.ffn(combined)
 
-        # ====================== Step 4: 特征组合（加强 pair-level interaction）======================
-        diff = torch.abs(h_A_final - h_B_final)
-        prod = h_A_final * h_B_final
-        combined = torch.cat([h_A_final, h_B_final, diff, prod], dim=1)  # (B, 4*H)
-        #combined = torch.cat([h_global_A_fp, h_global_B_fp], dim=1)  # (B, 4*H)
-        # ====================== Step 4: 获取DDI类型嵌入 ======================
-        # 如果提供了DDI类型标签，查询对应的嵌入
-        # if ddi_type is not None and self.training:
-        #     # ddi_type 应该是 [0, 85] 之间的整数
-        #     P_DDI = self.ddi_type_embedding[ddi_type.long()]  # (B, H)
-        # else:
-        #     # 推理时不使用DDI类型嵌入
-        #     P_DDI = torch.zeros(h_global_A.size(0), h_global_A.size(1), device=h_global_A.device)
-        #P_DDI = (ctx_for_A + ctx_for_B) / 2
-
-        # ====================== Step 5: 特征组合（新设计） ======================
-        # h_final = Concat(h_G_A, h_G_B, α · P_DDI)
-        # combined = torch.cat([
-        #    h_global_A,
-        #    h_global_B,
-        #    self.alpha * P_DDI
-        # ], dim=1)  # (B, 3*H)
-
-        # ====================== Step 6: 预测 ======================
-        score = self.ffn(combined).squeeze(-1)  # (B, 1) -> (B,)
-        return score
+        # 缓存最近一次片段交互，便于后续解释性分析。
+        self.last_interaction = {
+            'attn_ab': attn_ab.detach(),
+            'attn_ba': attn_ba.detach(),
+            'mask_a': mask_A.detach(),
+            'mask_b': mask_B.detach()
+        }
+        return logits
 
 
 # =============================================================================
@@ -409,8 +366,9 @@ def build_ddi_model(args: Namespace) -> nn.Module:
     """
     统一入口函数
     """
-    # BPR binary: 固定输出 1-dim score
-    args.output_size = 1
+    # 设置输出维度
+    output_size = args.num_tasks  # 一般是 1（二分类）或多个类型数
+    args.output_size = output_size
 
     model = DDIInteractionModel(
         classification=args.dataset_type == 'classification',

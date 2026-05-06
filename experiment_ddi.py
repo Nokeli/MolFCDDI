@@ -118,36 +118,22 @@ def run_experiment(args):
         print(f"Loading pretrained encoder from {args.checkpoint_path}")
         checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
         model = build_ddi_model(args)
-
-        # 只加载 encoder 部分的权重，避免污染 co-attention / gate / ffn 等随机初始化层
-        encoder_state = model.encoder.state_dict()
+        model_state_dict = model.encoder.state_dict() if args.encoder else model.state_dict()
         pretrained_state_dict = {}
-        skipped = []
-        for param_name, param_value in checkpoint.items():
-            # 兼容两种 checkpoint 格式：
-            # 1) 完整模型保存的 key 带 'encoder.' 前缀，如 'encoder.W_i_atom.weight'
-            # 2) 纯 encoder 保存的 key 不带前缀，如 'W_i_atom.weight'
-            if param_name.startswith('encoder.'):
-                encoder_key = param_name[len('encoder.'):]
+        for param_name in checkpoint.keys():
+            if param_name not in model_state_dict:
+                print(f'  [WARN] Pretrained param "{param_name}" not in model')
+            elif model_state_dict[param_name].shape != checkpoint[param_name].shape:
+                print(f'  [WARN] Shape mismatch for "{param_name}"')
             else:
-                encoder_key = param_name
-
-            if encoder_key not in encoder_state:
-                skipped.append(param_name)
-                continue
-            if encoder_state[encoder_key].shape != param_value.shape:
-                print(f'  [WARN] Shape mismatch for "{encoder_key}": '
-                      f'checkpoint {param_value.shape} vs model {encoder_state[encoder_key].shape}')
-                skipped.append(param_name)
-                continue
-            pretrained_state_dict[encoder_key] = param_value
-
-        model.encoder.load_state_dict(pretrained_state_dict, strict=False)
-        print(f"  Loaded {len(pretrained_state_dict)}/{len(encoder_state)} encoder params")
-        if skipped:
-            print(f"  Skipped {len(skipped)} non-encoder or mismatch params")
+                pretrained_state_dict[param_name] = checkpoint[param_name]
+        model_state_dict.update(pretrained_state_dict)
+        if args.encoder:
+            model.encoder.load_state_dict(model_state_dict)
+        else:
+            model.load_state_dict(model_state_dict)
     else:
-        print("Building model from scratch")
+        print("Building CrossFrag DDI model from scratch")
         model = build_ddi_model(args)
 
     if args.step == 'func_prompt':
@@ -258,19 +244,19 @@ def main():
     parser = ArgumentParser(description="MolFCDDI Experiment Runner")
 
     # Data / Split
-    parser.add_argument('--split_name', type=str, default='S1_random',
-                        choices=['S1_random', 'S2_one_unseen', 'S3_both_unseen'],
+    parser.add_argument('--split_name', type=str, default='warm_start',
+                        choices=['S1_random', 'S2_one_unseen', 'S3_both_unseen', 'warm_start'],
                         help='Split scenario')
     parser.add_argument('--mode', type=str, default='multiclass',
                         choices=['binary', 'multiclass'],
                         help='Classification mode')
     parser.add_argument('--split_dir', type=str,
-                        default='E:/学习/molfcddi/data/splits',
+                        default='./data/ddi_warm_start',
                         help='Directory containing split .npy files')
 
     # Model
     parser.add_argument('--checkpoint_path', type=str,
-                        default='E:/学习/molfcddi/ckpt/original_MoleculeModel.pkl',
+                        default='./ckpt/original_MoleculeModel.pkl',
                         help='Pretrained checkpoint path')
     parser.add_argument('--encoder', action='store_true', default=False,
                         help='Load only encoder from checkpoint')
@@ -323,7 +309,7 @@ def main():
     # Output
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     exp_name = f"{parser.parse_args().split_name}_{parser.parse_args().mode}_{timestamp}"
-    default_save_dir = f'E:/学习/molfcddi/dumped/{exp_name}'
+    default_save_dir = f'./dumped/{exp_name}'
     parser.add_argument('--save_dir', type=str, default=default_save_dir)
     parser.add_argument('--exp_name', type=str, default=exp_name)
     parser.add_argument('--exp_id', type=str, default=exp_name)

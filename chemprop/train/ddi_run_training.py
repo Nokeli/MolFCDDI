@@ -233,39 +233,27 @@ def ddi_run_training(args: Namespace, pretrain: bool, logger: Logger = None) -> 
         makedirs(save_dir)
         # Load/build model
         if args.checkpoint_path not in (None, ""):
-            debug(f'Loading pretrained encoder from {args.checkpoint_path}')
+            debug(f'Loading model from {args.checkpoint_path}')
             checkpoint = torch.load(args.checkpoint_path, map_location='cpu')
             model = build_ddi_model(args)
-
-            # 只加载 encoder 部分的权重，避免污染 co-attention / gate / ffn 等随机初始化层
-            encoder_state = model.encoder.state_dict()
+            model_state_dict = model.encoder.state_dict() if args.encoder else model.state_dict()
             pretrained_state_dict = {}
-            skipped = []
-            for param_name, param_value in checkpoint.items():
-                # 兼容两种 checkpoint 格式：
-                # 1) 完整模型保存的 key 带 'encoder.' 前缀，如 'encoder.W_i_atom.weight'
-                # 2) 纯 encoder 保存的 key 不带前缀，如 'W_i_atom.weight'
-                if param_name.startswith('encoder.'):
-                    encoder_key = param_name[len('encoder.'):]
+            for param_name in checkpoint.keys():
+                if param_name not in model_state_dict:
+                    print(f'Pretrained parameter "{param_name}" cannot be found in model parameters.')
+                elif model_state_dict[param_name].shape != checkpoint[param_name].shape:
+                    print(f'Pretrained parameter "{param_name}" '
+                          f'of shape {checkpoint[param_name].shape} does not match corresponding '
+                          f'model parameter of shape {model_state_dict[param_name].shape}.')
                 else:
-                    encoder_key = param_name
-
-                if encoder_key not in encoder_state:
-                    skipped.append(param_name)
-                    continue
-                if encoder_state[encoder_key].shape != param_value.shape:
-                    print(f'  [WARN] Shape mismatch for "{encoder_key}": '
-                          f'checkpoint {param_value.shape} vs model {encoder_state[encoder_key].shape}')
-                    skipped.append(param_name)
-                    continue
-                pretrained_state_dict[encoder_key] = param_value
-
-            model.encoder.load_state_dict(pretrained_state_dict, strict=False)
-            print(f"  Loaded {len(pretrained_state_dict)}/{len(encoder_state)} encoder params")
-            if skipped:
-                print(f"  Skipped {len(skipped)} non-encoder or mismatch params")
+                    pretrained_state_dict[param_name] = checkpoint[param_name]
+            model_state_dict.update(pretrained_state_dict)
+            if args.encoder:
+                model.encoder.load_state_dict(model_state_dict)
+            else:
+                model.load_state_dict(model_state_dict)
         else:
-            debug(f'Building model {model_idx}')
+            debug(f'Building CrossFrag DDI model {model_idx}')
             model = build_ddi_model(args)
 
         if args.step == 'func_prompt':
@@ -356,11 +344,15 @@ def ddi_run_training(args: Namespace, pretrain: bool, logger: Logger = None) -> 
 
             # Average test score
             avg_test_score = np.nanmean(test_scores['loss'])
-            # Save model checkpoint if improved validation score
-            # if args.minimize_score and avg_val_score < best_score or \
-            #         not args.minimize_score and avg_val_score > best_score:
-            #     best_score, best_epoch = avg_val_score, epoch
-            save_checkpoint(os.path.join(save_dir, 'model.pt'), model, scaler, features_scaler, args)
+
+            improved = (
+                (args.minimize_score and avg_val_score < best_score) or
+                (not args.minimize_score and avg_val_score > best_score)
+            )
+            if improved:
+                best_score = avg_val_score
+                best_epoch = epoch + 1
+                save_checkpoint(os.path.join(save_dir, 'model.pt'), model, scaler, features_scaler, args)
 
             # if args.early_stop and epoch >= args.last_early_stop:
             #     early_stop = stopper.step(avg_val_score)
@@ -372,7 +364,7 @@ def ddi_run_training(args: Namespace, pretrain: bool, logger: Logger = None) -> 
                 f'train loss: {avg_loss:.4f}, '
                 f'valid_{args.metric}: {avg_val_score:.6f}, '
                 f'test_{args.metric}: {avg_test_score:.6f}, '
-                f'best_epoch = {best_epoch + 1}, '
+                f'best_epoch = {best_epoch}, '
                 f'valid_accuracy = {val_scores["accuracy"]:.6f}, '
                 f'valid_auc = {val_scores["auc"]:.6f}, '
                 f'valid_aupr = {val_scores["aupr"]:.6f}, '
