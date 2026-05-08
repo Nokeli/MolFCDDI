@@ -192,7 +192,7 @@ class GatedFusion(nn.Module):
 class CrossFragmentInteraction(nn.Module):
     """
     显式建模药物A片段与药物B片段之间的交互矩阵。
-    输出双向交互摘要以及可解释的片段-片段注意力图。
+    输出双向交互摘要、pair-level 融合表示以及可解释的片段-片段注意力图。
     """
     def __init__(self, args: Namespace):
         super().__init__()
@@ -244,7 +244,7 @@ class CrossFragmentInteraction(nn.Module):
         pooled_b = self._masked_mean(cross_b, ~mask_b)
 
         cross_pair = self.out_proj(torch.cat([pooled_a, pooled_b], dim=-1))
-        return cross_pair, attn_ab, attn_ba
+        return pooled_a, pooled_b, cross_pair, attn_ab, attn_ba
 
 
 # =============================================================================
@@ -286,8 +286,8 @@ class DDIInteractionModel(nn.Module):
             raise ValueError(f"Unknown encoder: {encoder_name}")
 
     def create_ffn(self, args):
-        """最终表示 z_AB = [h_A, h_B, h_AB_frag]。"""
-        input_dim = args.hidden_size * 3
+        """最终表示 z_AB = [h_A, h_B, h_A*h_B, |h_A-h_B|, h_AB_frag]。"""
+        input_dim = args.hidden_size * 5
 
         dropout = nn.Dropout(args.dropout)
         activation = get_activation_function(args.activation)
@@ -339,18 +339,27 @@ class DDIInteractionModel(nn.Module):
         # Step 2: 显式片段-片段交互矩阵
         mask_A = fg_A.abs().sum(dim=-1) == 0
         mask_B = fg_B.abs().sum(dim=-1) == 0
-        cross_frag, attn_ab, attn_ba = self.cross_fragment(fg_A, fg_B, mask_A, mask_B)
+        pooled_a, pooled_b, cross_frag, attn_ab, attn_ba = self.cross_fragment(fg_A, fg_B, mask_A, mask_B)
 
-        # Step 3: 用片段交互摘要更新分子级表征
-        h_A_final = self.gate_A(h_global_A_fp, cross_frag)
-        h_B_final = self.gate_B(h_global_B_fp, cross_frag)
+        # Step 3: 用方向性感知的片段交互摘要分别更新 A / B
+        h_A_final = self.gate_A(h_global_A_fp, pooled_a)
+        h_B_final = self.gate_B(h_global_B_fp, pooled_b)
 
-        # Step 4: z_AB = [h_A, h_B, h_AB_frag]
-        combined = torch.cat([h_A_final, h_B_final, cross_frag], dim=1)
+        # Step 4: z_AB = [h_A, h_B, h_A*h_B, |h_A-h_B|, h_AB_frag]
+        combined = torch.cat([
+            h_A_final,
+            h_B_final,
+            h_A_final * h_B_final,
+            torch.abs(h_A_final - h_B_final),
+            cross_frag
+        ], dim=1)
         logits = self.ffn(combined)
 
         # 缓存最近一次片段交互，便于后续解释性分析。
         self.last_interaction = {
+            'pooled_a': pooled_a.detach(),
+            'pooled_b': pooled_b.detach(),
+            'cross_pair': cross_frag.detach(),
             'attn_ab': attn_ab.detach(),
             'attn_ba': attn_ba.detach(),
             'mask_a': mask_A.detach(),
