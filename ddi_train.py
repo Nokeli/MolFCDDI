@@ -44,6 +44,7 @@ def create_args():
                         choices=['binary', 'multiclass'])
     parser.add_argument('--split_dir', type=str,
                         default='./data/ddi_warm_start')
+    parser.add_argument('--explicit_split_dir', type=str, default=None)
 
     # Model
     parser.add_argument('--checkpoint_path', type=str,
@@ -65,6 +66,7 @@ def create_args():
     parser.add_argument('--activation', type=str, default='ReLU',
                         choices=['ReLU', 'LeakyReLU', 'PReLU', 'tanh', 'SELU', 'ELU', 'GELU'])
     parser.add_argument('--num_attention_heads', type=int, default=4)
+    parser.add_argument('--interaction_dropout', type=float, default=None)
     parser.add_argument('--increase_parm', type=int, default=1)
     parser.add_argument('--add_reactive', action='store_true', default=False)
 
@@ -156,10 +158,24 @@ def create_args():
     args.exp_id = f'{args.split_name}_{args.mode}'
 
     # Validate split files exist
-    for split in ['train', 'val', 'test']:
-        fpath = os.path.join(args.split_dir, f'{args.split_name}_{args.mode}_{split}.npy')
-        if not os.path.exists(fpath):
-            raise FileNotFoundError(f'Split file not found: {fpath}')
+    if args.explicit_split_dir:
+        required_files = ['train.csv', 's1.csv', 's2.csv']
+        for fname in required_files:
+            fpath = os.path.join(args.explicit_split_dir, fname)
+            if not os.path.exists(fpath):
+                raise FileNotFoundError(f'Explicit split file not found: {fpath}')
+
+        val_candidates = [
+            os.path.join(args.explicit_split_dir, 'val.csv'),
+            os.path.join(args.explicit_split_dir, 'val.cvs')
+        ]
+        if not any(os.path.exists(path) for path in val_candidates):
+            raise FileNotFoundError(f'Explicit validation split not found in {args.explicit_split_dir}')
+    else:
+        for split in ['train', 'val', 'test']:
+            fpath = os.path.join(args.split_dir, f'{args.split_name}_{args.mode}_{split}.npy')
+            if not os.path.exists(fpath):
+                raise FileNotFoundError(f'Split file not found: {fpath}')
 
     return args
 
@@ -191,6 +207,7 @@ def main():
     print(f"  Classes: {args.multiclass_num_classes}")
     print(f"  GPU: {args.gpu} | Epochs: {args.epochs} | Batch: {args.batch_size}")
     print(f"  Split dir: {args.split_dir}")
+    print(f"  Explicit split dir: {args.explicit_split_dir}")
     print(f"  Dump path: {args.dump_path}")
     print(f"{'='*60}\n")
 

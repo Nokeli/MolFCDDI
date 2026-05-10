@@ -269,9 +269,25 @@ def build_optimizer(model: nn.Module, args: Namespace) -> Optimizer:
     :return: An initialized Optimizer.
     """
     increase = ['prompt_generator']
+    weight_decay = getattr(args, 'l2_norm', 0.0)
     no_increase_param = [param for name, param in model.named_parameters() if not any(inc in name for inc in increase)]
     increase_param = [param for name, param in model.named_parameters() if any(inc in name for inc in increase)]
-    params = [{'params': no_increase_param, 'lr': args.init_lr, 'weight_decay': 0}, {'params': increase_param, 'lr': args.init_lr * args.increase_parm, 'weight_decay': 0}]
+    params = []
+
+    if no_increase_param:
+        params.append({
+            'params': no_increase_param,
+            'lr': args.init_lr,
+            'weight_decay': weight_decay
+        })
+
+    if increase_param:
+        params.append({
+            'params': increase_param,
+            'lr': args.init_lr * args.increase_parm,
+            'weight_decay': weight_decay
+        })
+
     return Adam(params)
 
 

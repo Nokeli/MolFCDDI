@@ -285,8 +285,89 @@ def get_ddi_data(path: str = None,
 
     skip_smiles = set()
 
-    # 如果没有提供CSV路径，加载npy数据
-    if path is not None:
+    def resolve_split_csv(split_dir: str, filename: str, fallbacks: List[str] = None) -> str:
+        candidates = [filename]
+        if fallbacks is not None:
+            candidates.extend(fallbacks)
+        for candidate in candidates:
+            full_path = os.path.join(split_dir, candidate)
+            if os.path.exists(full_path):
+                return full_path
+        raise FileNotFoundError(f'Could not find any of {candidates} in {split_dir}')
+
+    def load_drug_id_to_smiles(split_dir: str):
+        candidate_paths = [
+            os.path.join(split_dir, 'drug_smiles.csv'),
+            os.path.join(os.path.dirname(split_dir), 'drug_smiles.csv'),
+            os.path.join(os.path.dirname(os.path.dirname(split_dir)), 'drug_smiles.csv')
+        ]
+
+        for candidate_path in candidate_paths:
+            if os.path.exists(candidate_path):
+                mapping = {}
+                with open(candidate_path) as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        mapping[row['drug_id']] = row['smiles']
+                return mapping
+
+        raise FileNotFoundError(f'Could not find drug_smiles.csv near {split_dir}')
+
+    def load_csv_split(csv_path: str, drug_id_to_smiles=None):
+        datapoints = []
+        with open(csv_path) as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames or []
+            is_id_split = {'d1', 'd2', 'type'}.issubset(set(fieldnames))
+            is_smiles_split = (
+                {'smiles1', 'smiles2', 'label'}.issubset(set(fieldnames)) or
+                {'smile1', 'smile2', 'type'}.issubset(set(fieldnames))
+            )
+
+            for i, row in enumerate(reader):
+                if is_id_split:
+                    if drug_id_to_smiles is None:
+                        raise ValueError(f'Drug ID split {csv_path} requires a drug_id -> smiles mapping.')
+                    smiles1 = drug_id_to_smiles.get(row['d1'])
+                    smiles2 = drug_id_to_smiles.get(row['d2'])
+                    label = row['type']
+                elif is_smiles_split:
+                    smiles1 = row.get('smiles1', row.get('smile1'))
+                    smiles2 = row.get('smiles2', row.get('smile2'))
+                    label = row.get('label', row.get('type'))
+                else:
+                    continue
+
+                if smiles1 is None or smiles2 is None or label is None:
+                    continue
+                datapoints.append(
+                    MoleculeDatapoint_ddi(
+                        line=[smiles1, smiles2, label],
+                        use_compound_names=False
+                    )
+                )
+                if len(datapoints) >= max_data_size:
+                    break
+        return datapoints
+
+    explicit_split_dir = getattr(args, 'explicit_split_dir', None) if args is not None else None
+
+    if explicit_split_dir:
+        debug(f"Loading explicit CSV splits from {explicit_split_dir}")
+        drug_id_to_smiles = load_drug_id_to_smiles(explicit_split_dir)
+        train_csv = resolve_split_csv(explicit_split_dir, 'train.csv')
+        valid_csv = resolve_split_csv(explicit_split_dir, 'val.csv', fallbacks=['val.cvs'])
+        s1_csv = resolve_split_csv(explicit_split_dir, 's1.csv')
+        s2_csv = resolve_split_csv(explicit_split_dir, 's2.csv')
+
+        data['train'] = load_csv_split(train_csv, drug_id_to_smiles=drug_id_to_smiles)
+        data['valid'] = load_csv_split(valid_csv, drug_id_to_smiles=drug_id_to_smiles)
+        data['test'] = load_csv_split(s1_csv, drug_id_to_smiles=drug_id_to_smiles)
+        data['test_s1'] = load_csv_split(s1_csv, drug_id_to_smiles=drug_id_to_smiles)
+        data['test_s2'] = load_csv_split(s2_csv, drug_id_to_smiles=drug_id_to_smiles)
+
+    # 如果没有提供显式 CSV 切分，则加载 .npy 数据
+    elif path is not None:
         print("加载 .npy 文件...")
 
         # 支持自定义切分路径：优先使用 args.split_dir，否则使用默认路径
@@ -328,11 +409,17 @@ def get_ddi_data(path: str = None,
     train_dataset = MoleculeDataset(data['train'])
     valid_dataset = MoleculeDataset(data['valid'])
     test_dataset = MoleculeDataset(data['test'])
+    test_s1_dataset = MoleculeDataset(data['test_s1']) if 'test_s1' in data else None
+    test_s2_dataset = MoleculeDataset(data['test_s2']) if 'test_s2' in data else None
 
     # 输出debug信息
     debug(f"Train dataset size: {len(train_dataset)}")
     debug(f"Valid dataset size: {len(valid_dataset)}")
     debug(f"Test dataset size: {len(test_dataset)}")
+    if test_s1_dataset is not None:
+        debug(f"Test S1 dataset size: {len(test_s1_dataset)}")
+    if test_s2_dataset is not None:
+        debug(f"Test S2 dataset size: {len(test_s2_dataset)}")
 
     # 如果需要过滤无效SMILES
     if skip_invalid_smiles:
@@ -349,7 +436,12 @@ def get_ddi_data(path: str = None,
             debug(f'Warning: {original_test_len - len(test_dataset)} invalid DDI pairs found in test.')
 
     # 返回包含train, valid, test三个数据集的字典
-    return {'train': train_dataset, 'valid': valid_dataset, 'test': test_dataset}
+    result = {'train': train_dataset, 'valid': valid_dataset, 'test': test_dataset}
+    if test_s1_dataset is not None:
+        result['test_s1'] = test_s1_dataset
+    if test_s2_dataset is not None:
+        result['test_s2'] = test_s2_dataset
+    return result
 
 
 def load_data(data: MoleculeDataset,
@@ -609,4 +701,3 @@ def validate_data(data_path: str) -> Set[str]:
             errors.add('Found a target which is not a number.')
 
     return errors
-

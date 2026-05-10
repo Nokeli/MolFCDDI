@@ -202,7 +202,10 @@ class CrossFragmentInteraction(nn.Module):
         self.key_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=args.bias)
         self.value_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=args.bias)
         self.out_proj = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=args.bias)
-        self.dropout = nn.Dropout(args.dropout)
+        interaction_dropout = getattr(args, 'interaction_dropout', None)
+        if interaction_dropout is None:
+            interaction_dropout = args.dropout
+        self.dropout = nn.Dropout(interaction_dropout)
         self.norm = nn.LayerNorm(self.hidden_size)
 
     def _masked_mean(self, values: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:

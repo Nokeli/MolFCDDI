@@ -2,7 +2,7 @@ from argparse import Namespace
 import csv
 from logging import Logger
 import os
-from typing import List
+from typing import Dict, List
 import torch.nn as nn
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
@@ -101,6 +101,25 @@ def get_class_weights(train_data, n_classes=86):
         weights = weights.cuda() 
         return weights
 
+
+def evaluate_ddi_split(model, pretrain, data_loader, args, scaler, loss_func, logger=None):
+        pooling_type = getattr(args, 'pooling_type', 'attention')
+        preds, targets = predict(
+            model=model,
+            pretrain=pretrain,
+            data=data_loader,
+            batch_size=args.batch_size,
+            scaler=scaler,
+            pooling_type=pooling_type
+        )
+        return evaluate_predictions(
+            preds=preds,
+            targets=targets,
+            metric_func=loss_func,
+            dataset_type=args.dataset_type,
+            logger=logger
+        )
+
 def ddi_run_training(args: Namespace, pretrain: bool, logger: Logger = None) -> List[float]:
     """
     Trains a model and returns test scores on the model checkpoint with the highest validation score.
@@ -127,20 +146,28 @@ def ddi_run_training(args: Namespace, pretrain: bool, logger: Logger = None) -> 
     # Get data
     info('Loading data')
     # args.vocab = Vocab(args)
-    args.task_names = get_task_names(args.data_path)
+    if getattr(args, 'explicit_split_dir', None):
+        args.task_names = ['label']
+    else:
+        args.task_names = get_task_names(args.data_path)
     data = get_ddi_data(path=args.data_path, args=args, logger=logger)
     train_data = data['train']
     val_data = data['valid']
-    print(len(val_data))
     test_data = data['test']
+    extra_test_datasets: Dict[str, MoleculeDataset] = {}
+    if 'test_s1' in data:
+        extra_test_datasets['s1'] = data['test_s1']
+    if 'test_s2' in data:
+        extra_test_datasets['s2'] = data['test_s2']
+    if not extra_test_datasets:
+        extra_test_datasets['test'] = test_data
     args.num_tasks = train_data.num_tasks()
     args.features_size = train_data.features_size()
     info(f'Number of tasks = {args.num_tasks}')
-    print(train_data)
     train_loader, train_collator = create_ddi_dataloader(
         train_data,
         args=args,
-        batch_size=256,
+        batch_size=args.batch_size,
         shuffle=True,
         num_workers=0,  # 使用缓存时建议为0
         pretrain=False,
@@ -149,21 +176,24 @@ def ddi_run_training(args: Namespace, pretrain: bool, logger: Logger = None) -> 
     valid_loader, valid_collator = create_ddi_dataloader(
         val_data,
         args=args,
-        batch_size=256,
+        batch_size=args.batch_size,
         shuffle=False,
         num_workers=0,
         pretrain=False,
         cache_size=5000
     )
-    test_loader, test_collator = create_ddi_dataloader(
-        test_data,
-        args=args,
-        batch_size=256,
-        shuffle=False,
-        num_workers=0,
-        pretrain=False,
-        cache_size=5000
-    )
+    test_loaders = {}
+    for split_name, split_dataset in extra_test_datasets.items():
+        test_loader, _ = create_ddi_dataloader(
+            split_dataset,
+            args=args,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pretrain=False,
+            cache_size=5000
+        )
+        test_loaders[split_name] = test_loader
     # Split data
     debug(f'Load data from {args.exp_id} for Scaffold-{args.runs}')
     # if 0 < args.runs < 3:
@@ -184,12 +214,16 @@ def ddi_run_training(args: Namespace, pretrain: bool, logger: Logger = None) -> 
         features_scaler = train_data.normalize_features(replace_nan_token=0)
         val_data.normalize_features(features_scaler)
         test_data.normalize_features(features_scaler)
+        for split_dataset in extra_test_datasets.values():
+            split_dataset.normalize_features(features_scaler)
     else:
         features_scaler = None
 
     args.train_data_size = len(train_data)
-    debug(f'Total size = {len(data):,} | '
-          f'train size = {len(train_data):,} | val size = {len(val_data):,} | test size = {len(test_data):,}')
+    total_size = len(train_data) + len(val_data) + sum(len(split_dataset) for split_dataset in extra_test_datasets.values())
+    split_size_msg = ', '.join(f'{split_name} size = {len(split_dataset):,}' for split_name, split_dataset in extra_test_datasets.items())
+    debug(f'Total size = {total_size:,} | '
+          f'train size = {len(train_data):,} | val size = {len(val_data):,} | {split_size_msg}')
 
     # Initialize scaler and scale training targets by subtracting mean and dividing standard deviation (regression only)
     if args.dataset_type == 'regression':
@@ -207,26 +241,12 @@ def ddi_run_training(args: Namespace, pretrain: bool, logger: Logger = None) -> 
 
     # Set up test set evaluation
     # test_smiles, test_targets = test_data.smiles(), test_data.targets()
-    val_targets = val_data.targets()
-    val_targets = [int(x) for x in val_targets]
-    val_targets = torch.tensor(val_targets)
-    test_targets = test_data.targets()
-    test_targets = [int(x) for x in test_targets]
-    test_targets = torch.tensor(test_targets)
-    test_len = len(test_data)
     n_classes = args.multiclass_num_classes
     train_class_weights = get_class_weights(train_data, n_classes=n_classes)
-    valid_class_weights = get_class_weights(val_data, n_classes=n_classes)
-    test_class_weights = get_class_weights(test_data, n_classes=n_classes)
     train_class_weights = train_class_weights.cuda()
     train_loss_func = nn.CrossEntropyLoss(weight=train_class_weights)
-    val_loss_func = nn.CrossEntropyLoss(weight=valid_class_weights)
-    test_loss_func = nn.CrossEntropyLoss(weight=test_class_weights)
+    val_loss_func = nn.CrossEntropyLoss()
     loss_func = get_loss_func(args)
-    if args.dataset_type == 'multiclass':
-        sum_test_preds = np.zeros((test_len, args.num_tasks, args.multiclass_num_classes))
-    else:
-        sum_test_preds = np.zeros((test_len, args.num_tasks))
     # Train ensemble of models
     for model_idx in range(args.ensemble_size):
         save_dir = os.path.join(args.save_dir, f'model_{model_idx}')
@@ -276,7 +296,7 @@ def ddi_run_training(args: Namespace, pretrain: bool, logger: Logger = None) -> 
         # Early_stop
         early_stop = False
         # Run training
-        best_score = float('inf') if args.minimize_score else -float('inf')
+        best_score = -float('inf')
         best_epoch, n_iter = 0, 0
         if args.early_stop:
             stopper = Early_stop(patience=args.patience, minimize_score=args.minimize_score)
@@ -307,50 +327,38 @@ def ddi_run_training(args: Namespace, pretrain: bool, logger: Logger = None) -> 
             #     logger=logger
             # )
             # 使用注意力聚合（默认使用attention pooling）
-            pooling_type = getattr(args, 'pooling_type', 'attention')
-            val_preds,val_targets = predict(
+            val_scores = evaluate_ddi_split(
                 model=model,
                 pretrain=pretrain,
-                data=valid_loader,
-                batch_size=args.batch_size,
+                data_loader=valid_loader,
+                args=args,
                 scaler=scaler,
-                pooling_type=pooling_type
-            )
-            print(f"Preds shape: {np.array(val_preds).shape}")
-            val_scores = evaluate_predictions(
-                preds=val_preds,
-                targets=val_targets,
-                metric_func=train_loss_func,
-                dataset_type=args.dataset_type,
+                loss_func=val_loss_func,
                 logger=logger
             )
             # Average validation score
             avg_val_score = np.nanmean(val_scores['loss'])
-            test_preds,test_targets = predict(
-                model=model,
-                pretrain=pretrain,
-                data=test_loader,
-                batch_size=args.batch_size,
-                scaler=scaler,
-                pooling_type=pooling_type
-            )
-            test_scores = evaluate_predictions(
-                preds=test_preds,
-                targets=test_targets,
-                metric_func=train_loss_func,
-                dataset_type=args.dataset_type,
-                logger=logger
-            )
+            val_selection_score = val_scores['macro_f1']
+            test_scores = {}
+            for split_name, test_loader in test_loaders.items():
+                test_scores[split_name] = evaluate_ddi_split(
+                    model=model,
+                    pretrain=pretrain,
+                    data_loader=test_loader,
+                    args=args,
+                    scaler=scaler,
+                    loss_func=val_loss_func,
+                    logger=logger
+                )
 
             # Average test score
-            avg_test_score = np.nanmean(test_scores['loss'])
+            avg_test_score = np.nanmean([scores['loss'] for scores in test_scores.values()])
+            epoch_checkpoint_path = os.path.join(save_dir, f'epoch_{epoch + 1}.pt')
+            save_checkpoint(epoch_checkpoint_path, model, scaler, features_scaler, args)
 
-            improved = (
-                (args.minimize_score and avg_val_score < best_score) or
-                (not args.minimize_score and avg_val_score > best_score)
-            )
+            improved = val_selection_score > best_score
             if improved:
-                best_score = avg_val_score
+                best_score = val_selection_score
                 best_epoch = epoch + 1
                 save_checkpoint(os.path.join(save_dir, 'model.pt'), model, scaler, features_scaler, args)
 
@@ -365,14 +373,17 @@ def ddi_run_training(args: Namespace, pretrain: bool, logger: Logger = None) -> 
                 f'valid_{args.metric}: {avg_val_score:.6f}, '
                 f'test_{args.metric}: {avg_test_score:.6f}, '
                 f'best_epoch = {best_epoch}, '
-                f'valid_accuracy = {val_scores["accuracy"]:.6f}, '
-                f'valid_auc = {val_scores["auc"]:.6f}, '
-                f'valid_aupr = {val_scores["aupr"]:.6f}, '
-                f'valid_f1 = {val_scores["f1"]:.6f}'
-                f'test_accuracy = {test_scores["accuracy"]:.6f}, '
-                f'test_auc = {test_scores["auc"]:.6f}, '
-                f'test_aupr = {test_scores["aupr"]:.6f}, '
-                f'test_f1 = {test_scores["f1"]:.6f}')
+                f'val_acc = {val_scores["acc"]:.6f}, '
+                f'val_macro_f1 = {val_scores["macro_f1"]:.6f}, '
+                f'val_macro_precision = {val_scores["macro_precision"]:.6f}, '
+                f'val_macro_recall = {val_scores["macro_recall"]:.6f}, '
+                + ', '.join(
+                    f'{split_name}_acc = {scores["acc"]:.6f}, '
+                    f'{split_name}_macro_f1 = {scores["macro_f1"]:.6f}, '
+                    f'{split_name}_macro_precision = {scores["macro_precision"]:.6f}, '
+                    f'{split_name}_macro_recall = {scores["macro_recall"]:.6f}'
+                    for split_name, scores in test_scores.items()
+                ))
             # else:
             #     # info(
             #     #     f'Epoch{epoch + 1}/{args.epochs},train loss:{avg_loss:.4f},valid_{args.metric} = {avg_val_score:.6f},test_{args.metric} = {avg_test_score:.6},\
@@ -447,40 +458,36 @@ def ddi_run_training(args: Namespace, pretrain: bool, logger: Logger = None) -> 
         print(model)
 
         # Predict on the test data
-        test_preds,test_targets = predict(
-            model=model,
-            pretrain=pretrain,
-            data=test_loader,
-            batch_size=args.batch_size,
-            scaler=scaler,
-            pooling_type=pooling_type
-        )
+        final_test_scores = {}
+        for split_name, test_loader in test_loaders.items():
+            final_test_scores[split_name] = evaluate_ddi_split(
+                model=model,
+                pretrain=pretrain,
+                data_loader=test_loader,
+                args=args,
+                scaler=scaler,
+                loss_func=val_loss_func,
+                logger=logger
+            )
 
-        # Evaluate the model predictions
-        test_scores = evaluate_predictions(
-            preds=test_preds,
-            targets=test_targets,
-            metric_func=train_loss_func,
-            dataset_type=args.dataset_type,
-            logger=logger
-        )
-
-        # Calculate the average test score
-        avg_test_score = np.nanmean(test_scores['loss'])
+        avg_test_score = np.nanmean([scores['loss'] for scores in final_test_scores.values()])
         info(
-            f'Epoch {epoch + 1}/{args.epochs}, '
-            f'test loss: {avg_loss:.4f}, '
-            f'test_accuracy = {test_scores["accuracy"]:.6f}, '
-            f'test_auc = {test_scores["auc"]:.6f}, '
-            f'test_aupr = {test_scores["aupr"]:.6f}, '
-            f'test_f1 = {test_scores["f1"]:.6f}')
+            f'Best checkpoint evaluation, '
+            f'avg_test_loss = {avg_test_score:.4f}, '
+            + ', '.join(
+                f'{split_name}_acc = {scores["acc"]:.6f}, '
+                f'{split_name}_macro_f1 = {scores["macro_f1"]:.6f}, '
+                f'{split_name}_macro_precision = {scores["macro_precision"]:.6f}, '
+                f'{split_name}_macro_recall = {scores["macro_recall"]:.6f}'
+                for split_name, scores in final_test_scores.items()
+            ))
 
         # Display individual task scores (if requested)
         # NOTE: This loop is designed for multi-task settings where test_scores is a list of per-task scores.
         # For DDI, test_scores is a dict of metrics (loss, accuracy, auc, etc.) for a single task,
         # so this loop is not applicable and has been disabled.
-        if args.show_individual_scores and isinstance(test_scores, list):
-            for task_name, test_score in zip(args.task_names, test_scores):
+        if args.show_individual_scores and isinstance(final_test_scores, list):
+            for task_name, test_score in zip(args.task_names, final_test_scores):
                 info(f'Model test {task_name} {args.metric} = {test_score:.6f}')
 
         return avg_test_score

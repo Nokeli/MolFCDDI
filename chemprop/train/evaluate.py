@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from .predict import predict
 from chemprop.data import MoleculeDataset, StandardScaler
-from sklearn.metrics import accuracy_score, roc_auc_score, average_precision_score, f1_score
+from sklearn.metrics import accuracy_score, roc_auc_score, average_precision_score, f1_score, precision_score, recall_score
 import numpy as np
 import torch
 
@@ -76,12 +76,22 @@ def evaluate_predictions(preds: List[float],
     :param metric_func: Loss function to calculate the loss (e.g., cross-entropy).
     :param dataset_type: Dataset type ('classification', 'multiclass').
     :param logger: Logger.
-    :return: A dictionary with loss and evaluation metrics (Accuracy, AUC, AUPR, F1-score).
+    :return: A dictionary with loss and evaluation metrics.
     """
     info = logger.info if logger is not None else print
 
     if len(preds) == 0:
-        return {"loss": float('nan'), "accuracy": float('nan'), "auc": float('nan'), "aupr": float('nan'), "f1": float('nan')}
+        return {
+            "loss": float('nan'),
+            "accuracy": float('nan'),
+            "acc": float('nan'),
+            "auc": float('nan'),
+            "aupr": float('nan'),
+            "f1": float('nan'),
+            "macro_f1": float('nan'),
+            "macro_precision": float('nan'),
+            "macro_recall": float('nan')
+        }
 
     # Convert to tensors for loss calculation
     preds_tensor = torch.tensor(preds)
@@ -108,8 +118,6 @@ def evaluate_predictions(preds: List[float],
             
             # Get predicted class labels
             pred_labels = np.argmax(pred_probs, axis=1)
-            print(f"Predicted labels: {pred_labels}")
-            print(f"Targets: {targets_tensor}")
         else:
             # Binary classification - convert logits to probabilities via softmax
             pred_probs = torch.softmax(preds_tensor, dim=1).numpy()
@@ -120,6 +128,7 @@ def evaluate_predictions(preds: List[float],
         # Calculate accuracy
         accuracy = accuracy_score(targets_array, pred_labels)
         metrics["accuracy"] = accuracy
+        metrics["acc"] = accuracy
 
         # Calculate AUC (area under ROC curve) - uses PROBABILITIES
         try:
@@ -167,6 +176,21 @@ def evaluate_predictions(preds: List[float],
             info(f"Could not calculate F1-score: {e}")
             f1 = float('nan')
         metrics["f1"] = f1
+        metrics["macro_f1"] = f1
+
+        try:
+            macro_precision = precision_score(targets_array, pred_labels, average='macro', zero_division=0)
+        except ValueError as e:
+            info(f"Could not calculate macro precision: {e}")
+            macro_precision = float('nan')
+        metrics["macro_precision"] = macro_precision
+
+        try:
+            macro_recall = recall_score(targets_array, pred_labels, average='macro', zero_division=0)
+        except ValueError as e:
+            info(f"Could not calculate macro recall: {e}")
+            macro_recall = float('nan')
+        metrics["macro_recall"] = macro_recall
 
     return metrics
 
