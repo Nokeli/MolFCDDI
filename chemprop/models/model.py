@@ -201,7 +201,7 @@ class CrossFragmentInteraction(nn.Module):
         self.query_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=args.bias)
         self.key_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=args.bias)
         self.value_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=args.bias)
-        self.out_proj = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=args.bias)
+        self.out_proj = nn.Linear(self.hidden_size * 4, self.hidden_size, bias=args.bias)
         interaction_dropout = getattr(args, 'interaction_dropout', None)
         if interaction_dropout is None:
             interaction_dropout = args.dropout
@@ -246,7 +246,13 @@ class CrossFragmentInteraction(nn.Module):
         cross_b = self.norm(frag_b + cross_b)
         pooled_b = self._masked_mean(cross_b, ~mask_b)
 
-        cross_pair = self.out_proj(torch.cat([pooled_a, pooled_b], dim=-1))
+        pair_features = torch.cat([
+            pooled_a,
+            pooled_b,
+            pooled_a * pooled_b,
+            torch.abs(pooled_a - pooled_b)
+        ], dim=-1)
+        cross_pair = self.out_proj(pair_features)
         return pooled_a, pooled_b, cross_pair, attn_ab, attn_ba
 
 

@@ -1,0 +1,108 @@
+\section{Proposed Method}
+\label{sec:method}
+
+\subsection{Overview}
+
+We study multiclass drug--drug interaction (DDI) prediction under a fine-tuning setting built upon a pretrained molecular representation model. Rather than reconstructing a new hierarchical encoder from scratch, we preserve the pretrained MolFCL backbone and introduce an explicit cross-drug interaction head tailored for DDI prediction. The resulting framework follows a \emph{pretrained backbone + interaction refinement + pairwise classification} paradigm, which enables the model to retain the chemically meaningful priors learned by MolFCL while explicitly characterizing how structural fragments from two drugs interact with each other.
+
+Formally, given a drug pair $(D_A, D_B)$, our model first encodes the two drugs independently using a shared MolFCL encoder, and then performs a directional fragment-level interaction refinement between them. The refined interaction cues are subsequently injected into the prompt-enhanced molecular representations through gated fusion, and the final pair representation is used for DDI type prediction.
+
+\subsection{Shared MolFCL Backbone}
+
+For each input drug, the shared MolFCL encoder produces three levels of outputs:
+\begin{equation}
+(\mathbf{F}_A, \mathbf{h}^{g}_A, \mathbf{h}^{fp}_A), \quad
+(\mathbf{F}_B, \mathbf{h}^{g}_B, \mathbf{h}^{fp}_B),
+\end{equation}
+where $\mathbf{F}_A \in \mathbb{R}^{m \times d}$ and $\mathbf{F}_B \in \mathbb{R}^{n \times d}$ denote the fragment- or functional-group-level representations of the two drugs, $\mathbf{h}^{g}_A, \mathbf{h}^{g}_B \in \mathbb{R}^{d}$ are the original global molecular representations, and $\mathbf{h}^{fp}_A, \mathbf{h}^{fp}_B \in \mathbb{R}^{d}$ are the prompt-enhanced global representations. Here, $m$ and $n$ denote the numbers of valid fragments in the two drugs, and $d$ is the hidden dimensionality.
+
+Importantly, the MolFCL encoder is kept unchanged during model design. Therefore, the proposed method does not attempt to replace the pretrained representation backbone; instead, it augments MolFCL with an interaction-aware fine-tuning head specialized for DDI prediction.
+
+\subsection{Cross-Drug Fragment Interaction}
+
+The key motivation of our method is that DDI prediction is inherently relational: the interaction type depends not only on the individual properties of each drug, but also on how functional fragments from one drug affect those of the other. To explicitly capture such cross-drug dependencies, we introduce a Cross-Fragment Interaction module.
+
+Let $\mathbf{F}_A = \{\mathbf{f}^{A}_{1}, \ldots, \mathbf{f}^{A}_{m}\}$ and $\mathbf{F}_B = \{\mathbf{f}^{B}_{1}, \ldots, \mathbf{f}^{B}_{n}\}$ be the fragment representations of the two drugs. We first project them into query, key, and value spaces:
+\begin{equation}
+\mathbf{Q}_A = W_Q \mathbf{F}_A,\quad
+\mathbf{K}_B = W_K \mathbf{F}_B,\quad
+\mathbf{V}_B = W_V \mathbf{F}_B.
+\end{equation}
+The cross-drug interaction from $D_B$ to $D_A$ is then computed as
+\begin{equation}
+\mathbf{S}_{AB} =
+\mathrm{Softmax}\left(
+\frac{\mathbf{Q}_A \mathbf{K}_B^\top}{\sqrt{d}}
+\right),
+\end{equation}
+where $\mathbf{S}_{AB} \in \mathbb{R}^{m \times n}$ is the fragment--fragment interaction matrix. Based on this interaction matrix, drug $A$ aggregates contextual information from the fragments of drug $B$:
+\begin{equation}
+\widetilde{\mathbf{F}}_A = \mathbf{S}_{AB} \mathbf{V}_B.
+\end{equation}
+
+To preserve the intrinsic semantics of the original fragment representations, we apply residual refinement followed by layer normalization:
+\begin{equation}
+\mathbf{F}^{int}_A = \mathrm{LayerNorm}(\mathbf{F}_A + \widetilde{\mathbf{F}}_A).
+\end{equation}
+The interaction from $D_A$ to $D_B$ is computed symmetrically, yielding
+\begin{equation}
+\mathbf{F}^{int}_B = \mathrm{LayerNorm}(\mathbf{F}_B + \widetilde{\mathbf{F}}_B).
+\end{equation}
+
+This design explicitly models cross-drug fragment matching and contextualization, while avoiding the need to reconstruct a new atom--substructure--molecule hierarchical graph encoder.
+
+\subsection{Directional Interaction Summaries}
+
+After fragment-level refinement, we summarize the interaction-aware fragment representations of the two drugs via masked pooling:
+\begin{equation}
+\mathbf{p}_A = \mathrm{Pool}(\mathbf{F}^{int}_A), \quad
+\mathbf{p}_B = \mathrm{Pool}(\mathbf{F}^{int}_B),
+\end{equation}
+where $\mathbf{p}_A, \mathbf{p}_B \in \mathbb{R}^{d}$ are direction-aware interaction summaries. Specifically, $\mathbf{p}_A$ describes how drug $A$ is updated after incorporating information from drug $B$, while $\mathbf{p}_B$ has the analogous meaning in the opposite direction.
+
+We further fuse the two directional summaries into a pair-level fragment interaction representation:
+\begin{equation}
+\mathbf{h}^{frag}_{AB} = W_O [\mathbf{p}_A \,\|\, \mathbf{p}_B],
+\end{equation}
+where $\|$ denotes vector concatenation.
+
+Compared with direct concatenation of two molecular vectors, this formulation explicitly encodes which cross-drug fragment patterns are relevant to the predicted DDI type, thereby improving the interpretability of the model.
+
+\subsection{Directional Molecular Fusion}
+
+To inject the interaction-aware fragment information into the molecular-level representations, we update the prompt-enhanced global representations of the two drugs through directional gated fusion:
+\begin{equation}
+\mathbf{h}'_A = \mathrm{Gate}(\mathbf{h}^{fp}_A, \mathbf{p}_A), \qquad
+\mathbf{h}'_B = \mathrm{Gate}(\mathbf{h}^{fp}_B, \mathbf{p}_B).
+\end{equation}
+
+This design is intentionally asymmetric: drug $A$ is updated using the interaction context aggregated from drug $B$, whereas drug $B$ is updated using the interaction context aggregated from drug $A$. Hence, the two updated molecular representations $\mathbf{h}'_A$ and $\mathbf{h}'_B$ encode distinct directional interaction semantics.
+
+\subsection{Pair Representation for DDI Classification}
+
+The final representation of the drug pair is constructed by jointly considering molecular-level states, similarity patterns, difference patterns, and fragment-level interaction cues:
+\begin{equation}
+\mathbf{z}_{AB} =
+[
+\mathbf{h}'_A \,\|\, 
+\mathbf{h}'_B \,\|\, 
+\mathbf{h}'_A \odot \mathbf{h}'_B \,\|\, 
+|\mathbf{h}'_A - \mathbf{h}'_B| \,\|\, 
+\mathbf{h}^{frag}_{AB}
+],
+\end{equation}
+where $\odot$ denotes element-wise multiplication. The first two terms preserve the final global states of the two drugs, the third term captures feature-wise similarity, the fourth term models feature-wise discrepancy, and the last term explicitly represents cross-drug fragment interaction.
+
+The final multiclass DDI prediction is obtained by a feed-forward classifier:
+\begin{equation}
+\hat{\mathbf{y}}_{AB} = \mathrm{FFN}(\mathbf{z}_{AB}),
+\end{equation}
+where $\hat{\mathbf{y}}_{AB}$ denotes the predicted probability distribution over the DDI label space.
+
+\subsection{Relation to Existing DDI Models}
+
+The proposed framework is inspired by the general idea of iterative interaction modeling in prior DDI research, yet it differs fundamentally from methods that rebuild a complete hierarchical graph encoder. In particular, unlike HDN-DDI, our method does not explicitly reconstruct a new atom--substructure--molecule architecture. Instead, it retains the pretrained MolFCL backbone and introduces a lightweight cross-drug fragment interaction head during fine-tuning. Therefore, the proposed method is more naturally compatible with molecular pretraining, while still preserving explicit fragment-level interpretability for DDI prediction.
+
+\subsection{Summary}
+
+In summary, the proposed model can be characterized as a \emph{MolFCL backbone + directional cross-fragment interaction + gated molecular fusion + pairwise classifier} framework. It simultaneously exploits pretrained molecular priors, explicit cross-drug fragment interaction, and interpretable pairwise feature construction, making it particularly suitable for multiclass DDI prediction settings.

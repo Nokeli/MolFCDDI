@@ -83,20 +83,31 @@ def get_class_weights(train_data, n_classes=86):
         # 计算权重（样本少的类别权重大）
         weights = torch.zeros(n_classes)
         total_samples = len(labels)
+        present_labels = sorted(label_counts.keys())
         
         for label in range(n_classes):
             count = label_counts.get(label, 1)  # 避免除零
             # 使用平方根缓解极端权重
             weights[label] = (total_samples / count) ** 0.5
         
-        # 归一化
-        weights = weights / weights.mean()
+        # 只基于训练集中实际出现的类别做归一化，避免缺失类别扭曲整体尺度
+        if present_labels:
+            present_index = torch.tensor(present_labels, dtype=torch.long)
+            weights[present_index] = weights[present_index] / weights[present_index].mean()
+            missing_mask = torch.ones(n_classes, dtype=torch.bool)
+            missing_mask[present_index] = False
+            weights[missing_mask] = 0.0
     
         # 打印权重统计
         print(f"类别权重统计:")
-        print(f"  最大权重: {weights.max():.2f} (最稀有类别)")
-        print(f"  最小权重: {weights.min():.2f} (最常见类别)")
-        print(f"  平均权重: {weights.mean():.2f}")
+        if present_labels:
+            present_weights = weights[present_index]
+            print(f"  覆盖类别数: {len(present_labels)}/{n_classes}")
+            print(f"  最大权重: {present_weights.max():.2f} (最稀有类别)")
+            print(f"  最小权重: {present_weights.min():.2f} (最常见类别)")
+            print(f"  平均权重: {present_weights.mean():.2f}")
+        else:
+            print("  没有检测到有效标签，回退为全零权重。")
     
         weights = weights.cuda() 
         return weights
