@@ -9,6 +9,26 @@ from torch.utils.tensorboard import SummaryWriter
 import torch
 from collections import Counter
 import pickle
+
+
+class WeightedFocalLoss(nn.Module):
+    def __init__(self, weight: torch.Tensor = None, gamma: float = 1.5):
+        super().__init__()
+        self.weight = weight
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        log_probs = torch.log_softmax(logits, dim=1)
+        log_pt = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        pt = log_pt.exp()
+
+        if self.weight is not None:
+            alpha_t = self.weight[targets]
+        else:
+            alpha_t = 1.0
+
+        loss = -alpha_t * ((1 - pt) ** self.gamma) * log_pt
+        return loss.mean()
 from torch.optim.lr_scheduler import ExponentialLR
 from torch.utils.data import DataLoader
 from sklearn.decomposition import PCA
@@ -130,6 +150,29 @@ def evaluate_ddi_split(model, pretrain, data_loader, args, scaler, loss_func, lo
             dataset_type=args.dataset_type,
             logger=logger
         )
+
+
+def format_error_analysis(split_name: str, scores: dict) -> str:
+        analysis = scores.get('error_analysis') or {}
+        worst_classes = analysis.get('worst_classes') or []
+        top_confusions = analysis.get('top_confusions') or []
+
+        fragments = []
+        if worst_classes:
+            worst_text = '; '.join(
+                f'label {item["label"]}: f1={item["f1"]:.3f}, p={item["precision"]:.3f}, r={item["recall"]:.3f}, n={item["support"]}'
+                for item in worst_classes
+            )
+            fragments.append(f'{split_name} worst classes -> {worst_text}')
+
+        if top_confusions:
+            confusion_text = '; '.join(
+                f'{src}->{dst} ({count})'
+                for src, dst, count in top_confusions
+            )
+            fragments.append(f'{split_name} top confusions -> {confusion_text}')
+
+        return ' | '.join(fragments)
 
 def ddi_run_training(args: Namespace, pretrain: bool, logger: Logger = None) -> List[float]:
     """
@@ -255,7 +298,10 @@ def ddi_run_training(args: Namespace, pretrain: bool, logger: Logger = None) -> 
     n_classes = args.multiclass_num_classes
     train_class_weights = get_class_weights(train_data, n_classes=n_classes)
     train_class_weights = train_class_weights.cuda()
-    train_loss_func = nn.CrossEntropyLoss(weight=train_class_weights)
+    if getattr(args, 'loss_type', 'ce') == 'focal':
+        train_loss_func = WeightedFocalLoss(weight=train_class_weights, gamma=args.focal_gamma)
+    else:
+        train_loss_func = nn.CrossEntropyLoss(weight=train_class_weights)
     val_loss_func = nn.CrossEntropyLoss()
     loss_func = get_loss_func(args)
     # Train ensemble of models
@@ -388,11 +434,13 @@ def ddi_run_training(args: Namespace, pretrain: bool, logger: Logger = None) -> 
                 f'val_macro_f1 = {val_scores["macro_f1"]:.6f}, '
                 f'val_macro_precision = {val_scores["macro_precision"]:.6f}, '
                 f'val_macro_recall = {val_scores["macro_recall"]:.6f}, '
+                f'val_top3 = {val_scores["top3"]:.6f}, '
                 + ', '.join(
                     f'{split_name}_acc = {scores["acc"]:.6f}, '
                     f'{split_name}_macro_f1 = {scores["macro_f1"]:.6f}, '
                     f'{split_name}_macro_precision = {scores["macro_precision"]:.6f}, '
-                    f'{split_name}_macro_recall = {scores["macro_recall"]:.6f}'
+                    f'{split_name}_macro_recall = {scores["macro_recall"]:.6f}, '
+                    f'{split_name}_top3 = {scores["top3"]:.6f}'
                     for split_name, scores in test_scores.items()
                 ))
             # else:
@@ -489,9 +537,14 @@ def ddi_run_training(args: Namespace, pretrain: bool, logger: Logger = None) -> 
                 f'{split_name}_acc = {scores["acc"]:.6f}, '
                 f'{split_name}_macro_f1 = {scores["macro_f1"]:.6f}, '
                 f'{split_name}_macro_precision = {scores["macro_precision"]:.6f}, '
-                f'{split_name}_macro_recall = {scores["macro_recall"]:.6f}'
+                f'{split_name}_macro_recall = {scores["macro_recall"]:.6f}, '
+                f'{split_name}_top3 = {scores["top3"]:.6f}'
                 for split_name, scores in final_test_scores.items()
             ))
+        for split_name, scores in final_test_scores.items():
+            analysis_text = format_error_analysis(split_name, scores)
+            if analysis_text:
+                info(analysis_text)
 
         # Display individual task scores (if requested)
         # NOTE: This loop is designed for multi-task settings where test_scores is a list of per-task scores.

@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from .predict import predict
 from chemprop.data import MoleculeDataset, StandardScaler
-from sklearn.metrics import accuracy_score, roc_auc_score, average_precision_score, f1_score, precision_score, recall_score
+from sklearn.metrics import accuracy_score, roc_auc_score, average_precision_score, f1_score, precision_score, recall_score, precision_recall_fscore_support, confusion_matrix
 import numpy as np
 import torch
 
@@ -90,7 +90,9 @@ def evaluate_predictions(preds: List[float],
             "f1": float('nan'),
             "macro_f1": float('nan'),
             "macro_precision": float('nan'),
-            "macro_recall": float('nan')
+            "macro_recall": float('nan'),
+            "top3": float('nan'),
+            "error_analysis": {}
         }
 
     # Convert to tensors for loss calculation
@@ -129,6 +131,14 @@ def evaluate_predictions(preds: List[float],
         accuracy = accuracy_score(targets_array, pred_labels)
         metrics["accuracy"] = accuracy
         metrics["acc"] = accuracy
+
+        if dataset_type == 'multiclass':
+            topk = min(3, pred_probs.shape[1])
+            topk_preds = np.argsort(pred_probs, axis=1)[:, -topk:]
+            topk_hit = np.any(topk_preds == targets_array[:, None], axis=1)
+            metrics["top3"] = float(np.mean(topk_hit))
+        else:
+            metrics["top3"] = accuracy
 
         # Calculate AUC (area under ROC curve) - uses PROBABILITIES
         try:
@@ -191,6 +201,49 @@ def evaluate_predictions(preds: List[float],
             info(f"Could not calculate macro recall: {e}")
             macro_recall = float('nan')
         metrics["macro_recall"] = macro_recall
+
+        if dataset_type == 'multiclass':
+            n_classes = pred_probs.shape[1]
+            labels = list(range(n_classes))
+            precision_per_class, recall_per_class, f1_per_class, support_per_class = precision_recall_fscore_support(
+                targets_array,
+                pred_labels,
+                labels=labels,
+                zero_division=0
+            )
+            cm = confusion_matrix(targets_array, pred_labels, labels=labels)
+            confusions = []
+            for i in range(n_classes):
+                for j in range(n_classes):
+                    if i != j and cm[i, j] > 0:
+                        confusions.append((int(i), int(j), int(cm[i, j])))
+            confusions.sort(key=lambda item: item[2], reverse=True)
+
+            present_classes = [idx for idx, support in enumerate(support_per_class.tolist()) if support > 0]
+            worst_classes = sorted(
+                present_classes,
+                key=lambda idx: (f1_per_class[idx], support_per_class[idx])
+            )[:5]
+
+            metrics["error_analysis"] = {
+                "top_confusions": confusions[:5],
+                "worst_classes": [
+                    {
+                        "label": int(idx),
+                        "precision": float(precision_per_class[idx]),
+                        "recall": float(recall_per_class[idx]),
+                        "f1": float(f1_per_class[idx]),
+                        "support": int(support_per_class[idx])
+                    }
+                    for idx in worst_classes
+                ],
+                "predicted_class_histogram": {
+                    int(label): int(count)
+                    for label, count in zip(*np.unique(pred_labels, return_counts=True))
+                }
+            }
+        else:
+            metrics["error_analysis"] = {}
 
     return metrics
 

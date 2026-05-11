@@ -197,11 +197,19 @@ class CrossFragmentInteraction(nn.Module):
     def __init__(self, args: Namespace):
         super().__init__()
         self.hidden_size = args.hidden_size
-        self.scale = math.sqrt(self.hidden_size)
+        requested_heads = max(1, int(getattr(args, 'num_attention_heads', 2)))
+        if self.hidden_size % requested_heads == 0:
+            self.num_heads = requested_heads
+        elif self.hidden_size % 2 == 0:
+            self.num_heads = 2
+        else:
+            self.num_heads = 1
+        self.head_dim = self.hidden_size // self.num_heads
+        self.scale = math.sqrt(self.head_dim)
         self.query_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=args.bias)
         self.key_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=args.bias)
         self.value_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=args.bias)
-        self.out_proj = nn.Linear(self.hidden_size * 4, self.hidden_size, bias=args.bias)
+        self.out_proj = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=args.bias)
         interaction_dropout = getattr(args, 'interaction_dropout', None)
         if interaction_dropout is None:
             interaction_dropout = args.dropout
@@ -213,46 +221,56 @@ class CrossFragmentInteraction(nn.Module):
         denom = weights.sum(dim=1).clamp(min=1.0)
         return (values * weights).sum(dim=1) / denom
 
+    def _reshape_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = tensor.size()
+        tensor = tensor.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        return tensor.permute(0, 2, 1, 3).contiguous()
+
+    def _merge_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        batch_size, num_heads, seq_len, head_dim = tensor.size()
+        tensor = tensor.permute(0, 2, 1, 3).contiguous()
+        return tensor.view(batch_size, seq_len, num_heads * head_dim)
+
     def forward(self,
                 frag_a: torch.Tensor,
                 frag_b: torch.Tensor,
                 mask_a: torch.Tensor,
                 mask_b: torch.Tensor):
-        q_a = self.query_proj(frag_a)
-        k_b = self.key_proj(frag_b)
-        v_b = self.value_proj(frag_b)
+        q_a = self._reshape_heads(self.query_proj(frag_a))
+        k_b = self._reshape_heads(self.key_proj(frag_b))
+        v_b = self._reshape_heads(self.value_proj(frag_b))
 
         logits_ab = torch.matmul(q_a, k_b.transpose(-2, -1)) / self.scale
-        valid_ab = (~mask_a).unsqueeze(-1) & (~mask_b).unsqueeze(1)
+        valid_ab = ((~mask_a).unsqueeze(1).unsqueeze(-1) &
+                    (~mask_b).unsqueeze(1).unsqueeze(1))
         logits_ab = logits_ab.masked_fill(~valid_ab, -1e9)
         attn_ab = F.softmax(logits_ab, dim=-1)
         attn_ab = attn_ab * valid_ab.float()
-        attn_ab = self.dropout(attn_ab)
         cross_a = torch.matmul(attn_ab, v_b)
+        cross_a = self.dropout(cross_a)
+        cross_a = self._merge_heads(cross_a)
         cross_a = self.norm(frag_a + cross_a)
         pooled_a = self._masked_mean(cross_a, ~mask_a)
 
-        q_b = self.query_proj(frag_b)
-        k_a = self.key_proj(frag_a)
-        v_a = self.value_proj(frag_a)
+        q_b = self._reshape_heads(self.query_proj(frag_b))
+        k_a = self._reshape_heads(self.key_proj(frag_a))
+        v_a = self._reshape_heads(self.value_proj(frag_a))
 
         logits_ba = torch.matmul(q_b, k_a.transpose(-2, -1)) / self.scale
-        valid_ba = (~mask_b).unsqueeze(-1) & (~mask_a).unsqueeze(1)
+        valid_ba = ((~mask_b).unsqueeze(1).unsqueeze(-1) &
+                    (~mask_a).unsqueeze(1).unsqueeze(1))
         logits_ba = logits_ba.masked_fill(~valid_ba, -1e9)
         attn_ba = F.softmax(logits_ba, dim=-1)
         attn_ba = attn_ba * valid_ba.float()
-        attn_ba = self.dropout(attn_ba)
         cross_b = torch.matmul(attn_ba, v_a)
+        cross_b = self.dropout(cross_b)
+        cross_b = self._merge_heads(cross_b)
         cross_b = self.norm(frag_b + cross_b)
         pooled_b = self._masked_mean(cross_b, ~mask_b)
 
-        pair_features = torch.cat([
-            pooled_a,
-            pooled_b,
-            pooled_a * pooled_b,
-            torch.abs(pooled_a - pooled_b)
-        ], dim=-1)
-        cross_pair = self.out_proj(pair_features)
+        cross_pair = self.out_proj(torch.cat([pooled_a, pooled_b], dim=-1))
+        attn_ab = attn_ab.mean(dim=1)
+        attn_ba = attn_ba.mean(dim=1)
         return pooled_a, pooled_b, cross_pair, attn_ab, attn_ba
 
 

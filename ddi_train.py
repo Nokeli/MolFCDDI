@@ -65,7 +65,7 @@ def create_args():
     parser.add_argument('--undirected', action='store_true', default=False)
     parser.add_argument('--activation', type=str, default='ReLU',
                         choices=['ReLU', 'LeakyReLU', 'PReLU', 'tanh', 'SELU', 'ELU', 'GELU'])
-    parser.add_argument('--num_attention_heads', type=int, default=4)
+    parser.add_argument('--num_attention_heads', type=int, default=2)
     parser.add_argument('--interaction_dropout', type=float, default=None)
     parser.add_argument('--increase_parm', type=int, default=1)
     parser.add_argument('--add_reactive', action='store_true', default=False)
@@ -85,6 +85,8 @@ def create_args():
     parser.add_argument('--final_lr', type=float, default=1e-4)
     parser.add_argument('--warmup_epochs', type=int, default=5)
     parser.add_argument('--l2_norm', type=float, default=0)
+    parser.add_argument('--loss_type', type=str, default='ce', choices=['ce', 'focal'])
+    parser.add_argument('--focal_gamma', type=float, default=1.5)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--ensemble_size', type=int, default=1)
     parser.add_argument('--log_frequency', type=int, default=10)
